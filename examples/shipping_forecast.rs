@@ -10,6 +10,7 @@ use rig::completion::{Chat, Message, Prompt};
 use rig::prelude::*;
 use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
 use rig_claude_code::ClaudeCodeClient;
+use std::io::Write as _;
 
 const PREAMBLE: &str = "You write shipping forecasts in the style of the BBC. \
      Answer in at most two sentences. No preamble, no caveats. \
@@ -47,7 +48,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match content {
                 StreamedAssistantContent::Text(chunk) => {
                     print!("{}", chunk.text);
-                    use std::io::Write as _;
                     std::io::stdout().flush()?;
                 }
                 StreamedAssistantContent::ReasoningDelta { .. } => print!("."),

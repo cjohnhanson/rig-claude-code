@@ -109,6 +109,32 @@ async fn passes_the_lean_flags() {
 }
 
 #[tokio::test]
+async fn a_flag_like_prompt_reaches_the_child_as_the_prompt() {
+    // Verified against Claude Code 2.1.233: without the `--` separator,
+    // `claude -p '--version'` prints its version and never answers the
+    // prompt. Prompt text is attacker-influenceable in most deployments, so
+    // a prompt of `--dangerously-skip-permissions` must not become a flag.
+    let fake = FakeClaude::printing(&envelope("ok"));
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    model
+        .completion(request("--dangerously-skip-permissions"))
+        .await
+        .unwrap();
+
+    let argv = fake.argv();
+    let separator = argv
+        .iter()
+        .position(|arg| arg == "--")
+        .expect("an argument separator must precede the prompt");
+    assert_eq!(
+        argv.get(separator + 1).map(String::as_str),
+        Some("--dangerously-skip-permissions")
+    );
+    assert_eq!(separator + 2, argv.len(), "nothing may follow the prompt");
+}
+
+#[tokio::test]
 async fn preserves_an_empty_argument_through_the_process_boundary() {
     // `--tools ""` only strips the built-in tools if the empty string survives
     // as its own argument. A shell-quoting mistake would silently drop it and
@@ -136,9 +162,7 @@ async fn removes_the_nested_session_marker() {
     // Deliberate: this mutates process-wide state. The assertion is that the
     // marker does not reach the child even when this process has it set. The
     // library forbids unsafe; the test harness does not.
-    let _guard = ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = ENV_LOCK.lock().await;
     #[allow(unsafe_code)]
     unsafe {
         std::env::set_var("CLAUDECODE", "1");
@@ -254,8 +278,10 @@ async fn from_val_builds_a_working_client() {
 ///
 /// `set_var` is unsafe in edition 2024 precisely because other threads may be
 /// reading the environment. The test binary is multi-threaded, so these tests
-/// take a lock rather than trusting that they happen not to overlap.
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// take a lock rather than trusting that they happen not to overlap. The lock
+/// is async-aware because it is held across the awaited child process, which
+/// is the whole window during which the variable must stay set.
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
 async fn from_env_resolves_the_binary_from_the_environment() {
@@ -263,9 +289,7 @@ async fn from_env_resolves_the_binary_from_the_environment() {
     let path = fake.path();
 
     let client = {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = ENV_LOCK.lock().await;
         #[allow(unsafe_code)]
         unsafe {
             std::env::set_var(rig_claude_code::BINARY_ENV, &path);
@@ -287,9 +311,7 @@ async fn from_env_rejects_a_binary_it_cannot_run() {
     let missing = fake.missing_path().display().to_string();
 
     let result = {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = ENV_LOCK.lock().await;
         #[allow(unsafe_code)]
         unsafe {
             std::env::set_var(rig_claude_code::BINARY_ENV, &missing);
@@ -563,9 +585,7 @@ async fn a_stream_removes_the_nested_session_marker() {
     // Deliberate: the assertion is that the marker does not reach the child
     // even when this process has it set. The library forbids unsafe; the test
     // harness does not.
-    let _guard = ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = ENV_LOCK.lock().await;
     #[allow(unsafe_code)]
     unsafe {
         std::env::set_var("CLAUDECODE", "1");

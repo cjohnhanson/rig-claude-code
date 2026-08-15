@@ -101,6 +101,13 @@ pub(crate) fn build(
         args.push(system);
     }
 
+    // Everything after `--` is positional, whatever it looks like. Without
+    // it, a prompt that begins with a dash is parsed as a flag: `claude -p
+    // '--version'` prints the version and never answers, and a prompt of
+    // `--dangerously-skip-permissions` would be *obeyed* rather than
+    // answered. Prompt text is attacker-influenceable in most real
+    // deployments, so this separator is a security boundary, not a nicety.
+    args.push("--".to_owned());
     args.push(render_prompt(request));
 
     Ok(CommandSpec {
@@ -256,7 +263,12 @@ fn assistant_text(content: &OneOrMany<AssistantContent>) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use rig_core::completion::Document;
@@ -341,6 +353,50 @@ mod tests {
     fn puts_the_prompt_last() {
         let spec = build("claude", "haiku", &request("hello there"), Mode::Blocking).unwrap();
         assert_eq!(spec.args.last().map(String::as_str), Some("hello there"));
+    }
+
+    #[test]
+    fn separates_the_prompt_from_the_flags() {
+        let spec = build("claude", "haiku", &request("hi"), Mode::Blocking).unwrap();
+        let separator = spec
+            .args
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("the prompt must be introduced by an argument separator");
+        assert_eq!(
+            separator + 2,
+            spec.args.len(),
+            "the separator sits immediately before the prompt"
+        );
+    }
+
+    #[test]
+    fn a_prompt_that_looks_like_a_flag_stays_a_prompt() {
+        // Verified against Claude Code 2.1.233: without the separator,
+        // `claude -p '--version'` prints its version and never answers.
+        for hostile in [
+            "--version",
+            "--dangerously-skip-permissions",
+            "-p",
+            "--settings /tmp/evil.json",
+            "--help",
+        ] {
+            let spec = build("claude", "haiku", &request(hostile), Mode::Blocking).unwrap();
+            assert_eq!(spec.args.last().map(String::as_str), Some(hostile));
+            let separator = spec.args.iter().position(|arg| arg == "--").unwrap();
+            assert_eq!(
+                separator + 2,
+                spec.args.len(),
+                "`{hostile}` must sit after the separator, not be parsed as a flag"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_mode_also_separates_the_prompt() {
+        let spec = build("claude", "haiku", &request("--version"), Mode::Streaming).unwrap();
+        let separator = spec.args.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(separator + 2, spec.args.len());
     }
 
     #[test]
