@@ -4,6 +4,7 @@ use std::io::Write as _;
 use std::process::Stdio;
 use std::time::Duration;
 
+use rig_core::ProviderResponseError;
 use rig_core::completion::{
     CompletionError, CompletionModel, CompletionRequest, CompletionResponse,
 };
@@ -127,10 +128,35 @@ fn write_private_file(text: &str) -> Result<tempfile::NamedTempFile, CompletionE
 }
 
 /// Report a turn that outlived its deadline.
+///
+/// `ResponseError` rather than `ProviderError`, for the reason on
+/// [`child_failed`]: nothing this crate yields into a stream may be a
+/// `ProviderError`.
 fn timed_out(program: &str, timeout: Duration) -> CompletionError {
-    CompletionError::ProviderError(format!(
-        "`{program}` did not finish within {timeout:?}; the child was killed"
+    CompletionError::ResponseError(format!(
+        "`{program}` did not finish within {timeout:?}; the turn was abandoned \
+         and any child still running was killed"
     ))
+}
+
+/// Report a child that exited without success.
+///
+/// The child's stderr goes into a [`ProviderResponseError`] body, never into a
+/// `ProviderError` message. rig's stream driver treats any `ProviderError`
+/// whose text contains `aborted` as a cancellation and ends the stream
+/// cleanly, with no error item — and Node's own `AbortError` message is
+/// literally "This operation was aborted". Quoting untrusted stderr inside a
+/// `ProviderError` would let the CLI's most common failure text turn a failed
+/// streaming turn into an empty success. `ProviderResponse` is not sniffed,
+/// and it hands the caller the text as data.
+fn child_failed(program: &str, status: std::process::ExitStatus, stderr: &[u8]) -> CompletionError {
+    CompletionError::ProviderResponse(ProviderResponseError {
+        status: None,
+        body: format!(
+            "`{program}` exited with {status}: {}",
+            response::quote(stderr)
+        ),
+    })
 }
 
 /// A task that is cancelled when this guard is dropped.
@@ -488,10 +514,7 @@ impl CompletionModel for ClaudeCodeModel {
 
             let stderr_text = stderr_drain.finish(STDERR_GRACE).await;
             if !status.success() {
-                return Err(CompletionError::ProviderError(format!(
-                    "`{binary}` exited with {status}: {}",
-                    response::quote(&stderr_text)
-                )));
+                return Err(child_failed(&binary, status, &stderr_text));
             }
             if truncated {
                 // Without this the half-read buffer fails to parse and the
@@ -669,10 +692,7 @@ impl CompletionModel for ClaudeCodeModel {
                 yield Err(timed_out(&program, timeout.unwrap_or_default()));
                 return;
             };
-            if let Some(tail) = tail {
-                let _ = tail.finish(STDERR_GRACE).await;
-            }
-            let stderr_text = stderr_drain.finish(STDERR_GRACE).await;
+            let stderr_text = drain_within(deadline, tail, stderr_drain).await;
 
             if let Some(error) = conclude(&program, status, saw_terminal_frame, &stderr_text) {
                 yield Err(error);
@@ -699,11 +719,40 @@ fn settle(
         return Err(failure);
     }
     if !status.success() {
-        return Err(CompletionError::ProviderError(format!(
-            "`{binary}` produced a successful envelope but exited with {status}"
-        )));
+        return Err(child_failed(
+            binary,
+            status,
+            b"a successful envelope was produced first",
+        ));
     }
     envelope.into_completion_response()
+}
+
+/// Finish the stream's drains, keeping them inside the turn's deadline.
+///
+/// The grace periods sit inside the deadline too. Otherwise a turn whose child
+/// exited on time could still overrun the stated bound by however long a
+/// grandchild keeps the pipes open, up to the grace — and the README promises
+/// the bound covers the whole turn. Whatever stderr arrived is returned either
+/// way; a deadline that cuts the drain short costs at most the tail of an
+/// error message.
+async fn drain_within(
+    deadline: Option<tokio::time::Instant>,
+    tail: Option<Drain>,
+    stderr: Drain,
+) -> Vec<u8> {
+    let drains = async {
+        if let Some(tail) = tail {
+            let _ = tail.finish(STDERR_GRACE).await;
+        }
+        stderr.finish(STDERR_GRACE).await
+    };
+    match deadline {
+        Some(at) => tokio::time::timeout_at(at, drains)
+            .await
+            .unwrap_or_default(),
+        None => drains.await,
+    }
 }
 
 /// What a finished stream amounts to, once the child's status is known.
@@ -717,15 +766,14 @@ fn conclude(
     stderr_text: &[u8],
 ) -> Option<CompletionError> {
     match status {
-        Ok(status) if !status.success() => Some(CompletionError::ProviderError(format!(
-            "`{program}` exited with {status}: {}",
-            response::quote(stderr_text)
-        ))),
+        Ok(status) if !status.success() => Some(child_failed(program, status, stderr_text)),
         Ok(_) if !saw_terminal_frame => Some(CompletionError::ResponseError(format!(
             "`{program}` closed the stream without a terminal result frame"
         ))),
         Ok(_) => None,
-        Err(error) => Some(CompletionError::ProviderError(format!(
+        // `ResponseError`, not `ProviderError`: see `child_failed`. The OS
+        // error text is not ours to trust either.
+        Err(error) => Some(CompletionError::ResponseError(format!(
             "waiting for `{program}`: {error}"
         ))),
     }

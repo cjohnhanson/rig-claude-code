@@ -58,6 +58,12 @@ The public surface, in full:
   turn's pipes are read with a byte cap and an overflow is reported as a size
   limit rather than a parse failure; a streaming turn caps each frame at 16 MiB
   and fails the stream past that.
+- A child that fails is reported as `CompletionError::ProviderResponse`, with
+  its stderr as the body, never as `ProviderError`. rig's stream driver treats
+  any `ProviderError` whose text contains "aborted" as a cancellation and ends
+  the stream cleanly with no error item, and Node's own `AbortError` message
+  is "This operation was aborted" — so the CLI's most common failure text
+  would have turned a failed streaming turn into an empty success.
 - Every marker in the flattened transcript — the section tags, the role
   labels, each document's wrapper — carries a per-request nonce keyed by a
   per-process salt, so message content can neither close a section early nor

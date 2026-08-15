@@ -1089,6 +1089,64 @@ async fn a_non_zero_exit_still_quotes_stderr_a_grandchild_delayed() {
 }
 
 #[tokio::test]
+async fn a_failure_whose_stderr_says_aborted_still_fails_the_stream() {
+    // rig's stream driver treats any `ProviderError` whose text contains
+    // "aborted" as a cancellation and ends the stream cleanly, with no error
+    // item. Node's own AbortError message is literally "This operation was
+    // aborted", so the CLI's most common failure text would turn a failed
+    // turn into an empty success. Checked at the agent level, which is where
+    // the swallow happens.
+    let fake = FakeClaude::failing("Error: This operation was aborted", 1);
+    let client = ClaudeCodeClient::new(fake.path());
+    let agent = client.agent("haiku").build();
+
+    let mut stream = agent.stream_prompt("hi").await;
+    let mut saw_error = false;
+    let mut final_text: Option<String> = None;
+    while let Some(item) = stream.next().await {
+        match item {
+            Err(_) => saw_error = true,
+            Ok(rig::agent::MultiTurnStreamItem::FinalResponse(response)) => {
+                final_text = Some(response.output.clone());
+            }
+            Ok(_) => {}
+        }
+    }
+
+    assert!(
+        saw_error,
+        "a failed turn must surface as an error, not as final text {final_text:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_stream_timeout_covers_the_drains_after_the_child_exits() {
+    // The README says the bound covers the whole turn including the grace
+    // periods. A grandchild holding the pipes must not push a stream past it.
+    let fake = FakeClaude::builder()
+        .stdout(&frame_stream("ok", ""))
+        .orphan_for(Duration::from_secs(20))
+        .build();
+    // Generous enough that the frames arrive under a loaded suite, and far
+    // shorter than the 20 s the grandchild would otherwise impose.
+    let model = ClaudeCodeModel::new("haiku")
+        .with_binary(fake.path())
+        .with_timeout(Duration::from_secs(3));
+
+    let started = std::time::Instant::now();
+    let stream = model.stream(request("hi")).await.unwrap();
+    let (text, _, failure) = drain(stream).await;
+
+    assert_eq!(failure, None);
+    assert_eq!(text, "ok");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "the stream ran {:?} against a 3s bound",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
 async fn a_stream_surfaces_a_non_zero_exit_with_its_stderr() {
     let fake = FakeClaude::failing("session limit reached", 1);
     let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
