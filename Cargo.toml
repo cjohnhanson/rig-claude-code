@@ -18,10 +18,13 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 async-stream = "0.3.6"
+hyper = "1"
+hyper-util = { version = "0.1.20", features = ["service", "server", "server-auto", "tokio", "http1"] }
 # No default features: this crate makes no HTTP requests and uses no derive
 # macros, so it must not pin a TLS backend for applications that wanted a
 # different one.
 rig-core = { version = "0.41", default-features = false }
+rmcp = { version = "2.2", features = ["server", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3.27.0"
@@ -29,7 +32,8 @@ thiserror = "2"
 # `time` is used directly for the turn deadlines. It reaches the build
 # through reqwest today, which is an accident of rig-core's dependency
 # graph rather than a guarantee.
-tokio = { version = "1", features = ["process", "io-util", "rt", "time", "macros"] }
+tokio = { version = "1", features = ["process", "io-util", "rt", "time", "macros", "net"] }
+tower-service = "0.3"
 
 [dev-dependencies]
 futures = "0.3.34"
@@ -38,7 +42,9 @@ rig = "0.41"
 # macros, so it must not pin a TLS backend for applications that wanted a
 # different one.
 rig-core = { version = "0.41", default-features = false }
+rmcp = { version = "2.2", features = ["client", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
 schemars = "1"
+serde = "1"
 serde_json = "1"
 tempfile = "3.27.0"
 thiserror = "2"

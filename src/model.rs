@@ -4,11 +4,11 @@ use std::io::Write as _;
 use std::process::Stdio;
 use std::time::Duration;
 
-use rig_core::ProviderResponseError;
 use rig_core::completion::{
     CompletionError, CompletionModel, CompletionRequest, CompletionResponse,
 };
 use rig_core::streaming::{RawStreamingChoice, StreamingCompletionResponse};
+use rig_core::{OneOrMany, ProviderResponseError};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -16,6 +16,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 
+use crate::bridge::{Bridge, RecordedCall};
 use crate::client::{ClaudeCodeClient, DEFAULT_BINARY};
 use crate::request::CommandSpec;
 use crate::response::{self, CliResponse};
@@ -163,7 +164,7 @@ fn child_failed(program: &str, status: std::process::ExitStatus, stderr: &[u8]) 
 /// Dropping a bare [`JoinHandle`] detaches its task rather than cancelling it,
 /// so a cancelled turn would leave the feeder blocked in `write_all` and the
 /// drains blocked in `read` for as long as anything held the pipes open.
-struct AbortOnDrop(JoinHandle<()>);
+pub(crate) struct AbortOnDrop(pub(crate) JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -384,6 +385,22 @@ impl ClaudeCodeModel {
         &self.extra_args
     }
 
+    /// Start a per-turn MCP server when the request advertises tools.
+    async fn start_bridge(
+        &self,
+        request: &CompletionRequest,
+    ) -> Result<Option<Bridge>, CompletionError> {
+        if !request::advertises_tools(request) {
+            return Ok(None);
+        }
+        Bridge::start(&request.tools)
+            .await
+            .map(Some)
+            .map_err(|error| {
+                CompletionError::ProviderError(format!("cannot start the tool bridge: {error}"))
+            })
+    }
+
     /// Reject extra arguments that would override a flag the crate sets.
     fn check_extra_args(&self) -> Result<(), CompletionError> {
         for arg in &self.extra_args {
@@ -415,6 +432,8 @@ impl ClaudeCodeModel {
     fn spawn_child(
         &self,
         spec: &CommandSpec,
+        bridge: Option<&Bridge>,
+        tools: &[rig_core::completion::ToolDefinition],
     ) -> Result<(Child, AbortOnDrop, Option<tempfile::NamedTempFile>), CompletionError> {
         self.check_extra_args()?;
 
@@ -440,6 +459,13 @@ impl ClaudeCodeModel {
             command
                 .arg("--system-prompt-file")
                 .arg(file.path().as_os_str());
+        }
+        if let Some(bridge) = bridge {
+            command
+                .arg("--mcp-config")
+                .arg(bridge.mcp_config())
+                .arg("--allowedTools")
+                .arg(Bridge::allowed_tools(tools));
         }
         if let Some(dir) = &self.current_dir {
             command.current_dir(dir);
@@ -478,7 +504,9 @@ impl CompletionModel for ClaudeCodeModel {
         request: CompletionRequest,
     ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
         let spec = request::build(&self.model, &request, request::Mode::Blocking)?;
-        let (mut child, feed, _system_file) = self.spawn_child(&spec)?;
+        let bridge = self.start_bridge(&request).await?;
+        let (mut child, feed, _system_file) =
+            self.spawn_child(&spec, bridge.as_ref(), &request.tools)?;
 
         let stdout = require_pipe(child.stdout.take(), "stdout")?;
         let stderr = require_pipe(child.stderr.take(), "stderr")?;
@@ -497,7 +525,7 @@ impl CompletionModel for ClaudeCodeModel {
             // grandchild is holding the pipe open, which is the whole reason
             // the grace exists.
             if let Some(envelope) = response::find_envelope(&stdout_drain.snapshot()) {
-                return settle(&binary, envelope, status);
+                return settle(&binary, envelope, status, bridge.as_ref());
             }
             let truncated = stdout_drain.truncated();
             let stdout_bytes = stdout_drain.finish(STDOUT_GRACE).await;
@@ -508,7 +536,7 @@ impl CompletionModel for ClaudeCodeModel {
             // or holding only an internal code. Checking the status first
             // would discard the only readable explanation.
             if let Some(envelope) = response::find_envelope(&stdout_bytes) {
-                return settle(&binary, envelope, status);
+                return settle(&binary, envelope, status, bridge.as_ref());
             }
 
             let stderr_text = stderr_drain.finish(STDERR_GRACE).await;
@@ -561,7 +589,9 @@ impl CompletionModel for ClaudeCodeModel {
         request: CompletionRequest,
     ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
         let spec = request::build(&self.model, &request, request::Mode::Streaming)?;
-        let (mut child, feed, system_file) = self.spawn_child(&spec)?;
+        let bridge = self.start_bridge(&request).await?;
+        let (mut child, feed, system_file) =
+            self.spawn_child(&spec, bridge.as_ref(), &request.tools)?;
 
         let stdout = require_pipe(child.stdout.take(), "stdout")?;
         let stderr = require_pipe(child.stderr.take(), "stderr")?;
@@ -713,6 +743,7 @@ fn settle(
     binary: &str,
     envelope: CliResponse,
     status: std::process::ExitStatus,
+    bridge: Option<&Bridge>,
 ) -> Result<CompletionResponse<CliResponse>, CompletionError> {
     if let Some(failure) = envelope.failure() {
         return Err(failure);
@@ -724,7 +755,20 @@ fn settle(
             b"a successful envelope was produced first",
         ));
     }
-    envelope.into_completion_response()
+    let mut response = envelope.into_completion_response()?;
+    // Recorded tool calls replace the turn's text. The model wrote that text
+    // against placeholder results, and rig is about to run the real calls and
+    // ask again; returning the text as well would hand rig an answer built on
+    // nothing.
+    if let Some(calls) = bridge
+        .map(Bridge::take_calls)
+        .filter(|calls| !calls.is_empty())
+    {
+        let content: Vec<_> = calls.into_iter().map(RecordedCall::into_content).collect();
+        response.choice = OneOrMany::many(content)
+            .map_err(|_| CompletionError::ResponseError("recorded calls vanished".to_owned()))?;
+    }
+    Ok(response)
 }
 
 /// Finish the stream's drains, keeping them inside the turn's deadline.
@@ -813,7 +857,7 @@ mod tests {
             result: Some("the answer".to_owned()),
             ..Default::default()
         };
-        let error = settle("claude", envelope, exit_with(3)).unwrap_err();
+        let error = settle("claude", envelope, exit_with(3), None).unwrap_err();
         assert!(error.to_string().contains("exited with"), "{error}");
     }
 
@@ -824,7 +868,7 @@ mod tests {
             subtype: "error_max_turns".to_owned(),
             ..Default::default()
         };
-        let error = settle("claude", envelope, exit_with(0)).unwrap_err();
+        let error = settle("claude", envelope, exit_with(0), None).unwrap_err();
         assert!(error.to_string().contains("error_max_turns"), "{error}");
     }
 
@@ -834,7 +878,7 @@ mod tests {
             result: Some("the answer".to_owned()),
             ..Default::default()
         };
-        assert!(settle("claude", envelope, exit_with(0)).is_ok());
+        assert!(settle("claude", envelope, exit_with(0), None).is_ok());
     }
 
     #[test]

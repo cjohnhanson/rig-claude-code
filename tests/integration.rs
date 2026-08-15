@@ -21,7 +21,7 @@ use common::{FakeClaude, PAUSE};
 use futures::StreamExt as _;
 use rig::completion::{Chat, Message, Prompt};
 use rig::prelude::*;
-use rig_claude_code::{ClaudeCodeClient, ClaudeCodeModel, CliResponse, UnsupportedSetting};
+use rig_claude_code::{ClaudeCodeClient, ClaudeCodeModel, CliResponse};
 use rig_core::OneOrMany;
 use rig_core::completion::{AssistantContent, CompletionModel, CompletionRequest};
 use rig_core::streaming::{StreamedAssistantContent, StreamingCompletionResponse};
@@ -1420,33 +1420,113 @@ async fn an_agent_with_context_documents_sends_them_with_their_ids() {
 }
 
 #[tokio::test]
-async fn an_agent_with_a_tool_fails_with_a_downcastable_error() {
-    let fake = FakeClaude::printing(&envelope("ok"));
-    let client = ClaudeCodeClient::new(fake.path());
+async fn a_tool_call_from_the_cli_comes_back_as_a_rig_tool_call() {
+    // The model level of the loop. The fake does what the real CLI does when
+    // its model emits a tool call: it speaks MCP over HTTP to the bridge the
+    // crate started, and the turn's response carries the recorded call.
+    let fake = FakeClaude::builder()
+        .stdout(&envelope("I called the tool."))
+        .calls_mcp_tool("add", &serde_json::json!({"left": 2, "right": 3}))
+        .build();
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
 
-    let agent = client.agent("haiku").tool(tools::Add).build();
-    let error = agent.prompt("add 2 and 2").await.unwrap_err();
+    let mut req = request("add 2 and 3");
+    req.tools = vec![rig_core::completion::ToolDefinition {
+        name: "add".to_owned(),
+        description: "Add two integers".to_owned(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {"left": {"type": "integer"}, "right": {"type": "integer"}},
+            "required": ["left", "right"]
+        }),
+    }];
+    let response = model.completion(req).await.unwrap();
 
-    let rendered = error.to_string();
-    assert!(rendered.contains("tool definitions"), "{rendered}");
-    assert!(rendered.contains("MCP"), "{rendered}");
-
-    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&error);
-    let mut refusal = None;
-    while let Some(current) = source {
-        if let Some(found) = current.downcast_ref::<UnsupportedSetting>() {
-            refusal = Some(*found);
-            break;
+    match response.choice.first() {
+        AssistantContent::ToolCall(call) => {
+            assert_eq!(call.function.name, "add");
+            assert_eq!(
+                call.function.arguments.get("left"),
+                Some(&serde_json::json!(2))
+            );
+            assert_eq!(
+                call.function.arguments.get("right"),
+                Some(&serde_json::json!(3))
+            );
         }
-        source = std::error::Error::source(current);
+        other => panic!("the recorded call must replace the text: {other:?}"),
     }
     assert_eq!(
-        refusal.map(|r| r.setting),
-        Some("tool definitions"),
-        "a caller falling back to another provider must branch on the cause, \
-         not on the message text"
+        response.choice.len(),
+        1,
+        "text is discarded when calls exist"
     );
-    assert_eq!(fake.spawn_count(), 0);
+
+    let reply = fake.mcp_reply(0).expect("the bridge answered the call");
+    assert!(
+        reply.contains("recorded"),
+        "the CLI got the placeholder: {reply}"
+    );
+    assert!(
+        fake.value_after("--mcp-config").is_some(),
+        "the bridge was passed to the CLI"
+    );
+    assert_eq!(
+        fake.value_after("--allowedTools").as_deref(),
+        Some("mcp__rig__add")
+    );
+}
+
+#[tokio::test]
+async fn a_turn_without_tool_calls_keeps_its_text() {
+    let fake = FakeClaude::printing(&envelope("four"));
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let mut req = request("what is 2 and 2?");
+    req.tools = vec![rig_core::completion::ToolDefinition {
+        name: "add".to_owned(),
+        description: "Add".to_owned(),
+        parameters: serde_json::json!({"type": "object"}),
+    }];
+    let response = model.completion(req).await.unwrap();
+
+    assert_eq!(text_of(&response), "four");
+}
+
+#[tokio::test]
+async fn an_agent_with_a_tool_runs_the_whole_loop_through_rig() {
+    // The agent level: rig sees the recorded call, executes its own tool
+    // (`tools::Add` below), appends the result, and asks again. The fake is
+    // invoked twice: once producing a call, once producing the answer. Its
+    // spawn count proves both turns happened, and its stdin on the second
+    // turn proves the tool's real result reached the model.
+    let fake = FakeClaude::builder()
+        .stdout(&envelope("I called the tool."))
+        .calls_mcp_tool("add", &serde_json::json!({"left": 2, "right": 3}))
+        .then_prints(&envelope("The sum is 5."))
+        .build();
+    let client = ClaudeCodeClient::new(fake.path());
+    // rig's default budget is one model turn. A tool call needs two: one to
+    // ask, one to answer with the result in hand.
+    let agent = client
+        .agent("haiku")
+        .tool(tools::Add)
+        .default_max_turns(2)
+        .build();
+
+    let answer = agent.prompt("add 2 and 3").await.unwrap();
+
+    assert_eq!(answer, "The sum is 5.");
+    assert_eq!(fake.spawn_count(), 2, "one turn to call, one to answer");
+    let second_turn_prompt = fake.stdin();
+    assert!(
+        second_turn_prompt.contains("[called add with"),
+        "the model must see what it asked: {second_turn_prompt}"
+    );
+    assert!(
+        second_turn_prompt.contains("[result of call") && second_turn_prompt.contains("] 5"),
+        "the tool's real result, computed by rig, must reach the model: {second_turn_prompt}"
+    );
 }
 
 #[tokio::test]

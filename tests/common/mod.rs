@@ -54,6 +54,12 @@ pub struct FakeClaudeBuilder {
     /// Let a backgrounded grandchild write the stdout fixture, this many
     /// seconds after the child itself has exited.
     orphan_writes_after: Option<f32>,
+    /// Before printing stdout, call these tools on the MCP server named by
+    /// `--mcp-config`, as `(name, arguments JSON)` pairs.
+    mcp_calls: Vec<(String, String)>,
+    /// Stdout for the second and later spawns, when it should differ from the
+    /// first. MCP calls apply to the first spawn only.
+    later_stdout: Option<String>,
     orphan_seconds: Option<f32>,
     sentinel_after: Option<f32>,
 }
@@ -84,6 +90,8 @@ impl FakeClaude {
             system_prompt_delay: None,
             repeat_forever: None,
             orphan_writes_after: None,
+            mcp_calls: Vec::new(),
+            later_stdout: None,
             orphan_seconds: None,
             sentinel_after: None,
         }
@@ -200,6 +208,11 @@ impl FakeClaude {
         self.dir.path().join("sentinel").exists()
     }
 
+    /// What the MCP server replied to the fake's `n`th tool call, if any.
+    pub fn mcp_reply(&self, n: usize) -> Option<String> {
+        self.read(&format!("mcp_reply_{n}"))
+    }
+
     /// The working directory the child ran in.
     pub fn working_dir(&self) -> Option<String> {
         self.read("cwd").map(|text| text.trim().to_owned())
@@ -287,6 +300,25 @@ impl FakeClaudeBuilder {
         self
     }
 
+    /// Call a tool on the MCP server named by `--mcp-config` before printing
+    /// stdout. This is what the real CLI does when its model emits a tool
+    /// call: it speaks MCP over HTTP to the bridge the crate started.
+    #[must_use]
+    pub fn calls_mcp_tool(mut self, name: &str, arguments: &serde_json::Value) -> Self {
+        self.mcp_calls
+            .push((name.to_owned(), arguments.to_string()));
+        self
+    }
+
+    /// Print `stdout` on the second and later spawns instead of the first
+    /// fixture, and make no MCP calls on those spawns. A multi-turn tool loop
+    /// is scripted this way: call on turn one, answer on turn two.
+    #[must_use]
+    pub fn then_prints(mut self, stdout: &str) -> Self {
+        self.later_stdout = Some(stdout.to_owned());
+        self
+    }
+
     /// Repeat the stdout fixture forever, pausing `interval` between repeats.
     #[must_use]
     pub fn repeat_forever(mut self, interval: Duration) -> Self {
@@ -324,67 +356,38 @@ impl FakeClaudeBuilder {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path();
 
-        // A pause inside stdout is expressed by splitting the fixture on the
-        // marker at build time and writing the halves as two files. The
-        // script then emits one, sleeps, and emits the other. Doing the split
-        // here rather than in the script keeps the shell portable: the awk
-        // that used to do it relied on `RT`, a gawk extension, and Ubuntu's
-        // default mawk never sets it — so the pause silently never happened
-        // and every "arrives before the turn ends" test was reading a
-        // completed buffer.
-        let (first_half, second_half) = match (self.delay_mid, self.stdout.split_once(PAUSE)) {
-            (Some(_), Some((first, second))) => (first.to_owned(), second.to_owned()),
-            // An unused marker would otherwise reach the stream as content.
-            _ => (self.stdout.replace(PAUSE, ""), String::new()),
-        };
+        let (first_half, second_half) = split_fixture(&self.stdout, self.delay_mid.is_some());
         fs::write(path.join("stdout"), &first_half).expect("write stdout fixture");
         fs::write(path.join("stdout2"), &second_half).expect("write stdout tail fixture");
+        if let Some(later) = &self.later_stdout {
+            fs::write(path.join("stdout_later"), later).expect("write later fixture");
+        }
+        let emit_stdout = emit_stdout_script(
+            self.delay_mid,
+            self.repeat_forever,
+            self.orphan_writes_after,
+        );
+
         fs::write(path.join("stderr"), &self.stderr).expect("write stderr fixture");
+        // `||` records a failed write: a reader that stops early drops its end
+        // and the child takes EPIPE part-way through.
+        let emit_stderr =
+            "cat \"$here/stderr\" >&2 || echo failed > \"$here/write_failed\"\n".to_owned();
 
         let sleep_before = self
             .delay_before
             .map(|seconds| format!("sleep {seconds}\n"))
             .unwrap_or_default();
-
-        // A pause inside stdout is expressed by splitting the fixture on the
-        // marker and sleeping between the halves.
-        let emit_stdout = match self.delay_mid {
-            Some(seconds) => {
-                format!("cat \"$here/stdout\"\nsleep {seconds}\ncat \"$here/stdout2\"\n")
-            }
-            None => "cat \"$here/stdout\"\n".to_owned(),
-        };
-
+        let sleep_after = self
+            .delay_after
+            .map(|seconds| format!("sleep {seconds}\n"))
+            .unwrap_or_default();
         let orphan = self
             .orphan_seconds
             .map(|seconds| format!("( sleep {seconds} ) &\n"))
             .unwrap_or_default();
 
-        let sleep_after = self
-            .delay_after
-            .map(|seconds| format!("sleep {seconds}\n"))
-            .unwrap_or_default();
-
-        let sentinel = self
-            .sentinel_after
-            .map(|seconds| format!("sleep {seconds}\ntouch \"$here/sentinel\"\n"))
-            .unwrap_or_default();
-
-        // `||` records a failed write: a reader that stops early drops its end
-        // and the child takes EPIPE part-way through.
-        let emit_stderr =
-            "cat \"$here/stderr\" >&2 || echo failed > \"$here/write_failed\"\n".to_owned();
-        let emit_stdout = match self.repeat_forever {
-            Some(interval) => format!("while :; do {emit_stdout}sleep {interval}; done\n"),
-            None => emit_stdout,
-        };
-
-        let emit_stdout = match self.orphan_writes_after {
-            Some(seconds) => {
-                format!("( sleep {seconds}; cat \"$here/stdout\" ) &\n")
-            }
-            None => emit_stdout,
-        };
+        let mcp = mcp_script(&self.mcp_calls);
 
         let (first, second) = if self.stderr_first {
             (emit_stderr, emit_stdout)
@@ -405,6 +408,11 @@ impl FakeClaudeBuilder {
             ""
         };
 
+        let sentinel = self
+            .sentinel_after
+            .map(|seconds| format!("sleep {seconds}\ntouch \"$here/sentinel\"\n"))
+            .unwrap_or_default();
+
         let system_prompt_wait = self
             .system_prompt_delay
             .map(|seconds| format!("sleep {seconds}\n"))
@@ -419,11 +427,23 @@ impl FakeClaudeBuilder {
 printf '%s\0' "$@" > "$here/argv"
 {pre_stdin}cat > "$here/stdin"
 printf 'x' >> "$here/spawns"
+# On a later spawn, print the later fixture and make no MCP calls. A
+# multi-turn tool loop is scripted this way: call on turn one, answer after.
+first_spawn=1
+if [ "$(wc -c < "$here/spawns" | tr -d ' ')" -gt 1 ] && [ -f "$here/stdout_later" ]; then
+  first_spawn=
+  cp "$here/stdout_later" "$here/stdout"
+  : > "$here/stdout2"
+fi
 pwd > "$here/cwd"
 env > "$here/env"
 # Copy the system prompt while the child is alive: the caller deletes the
 # temporary file as soon as the turn ends.
+mcp_config=
+next_is_mcp=
 for a in "$@"; do
+  if [ -n "$next_is_mcp" ]; then mcp_config="$a"; next_is_mcp=; fi
+  if [ "$a" = "--mcp-config" ]; then next_is_mcp=1; fi
   if [ -n "$next_is_sp" ]; then
     {system_prompt_wait}cp "$a" "$here/system_prompt" 2>/dev/null
     # GNU stat and BSD stat disagree on every flag. Try the GNU spelling
@@ -436,7 +456,7 @@ for a in "$@"; do
   if [ "$a" = "--system-prompt-file" ]; then next_is_sp=1; fi
 done
 if [ -n "${{CLAUDECODE+set}}" ]; then echo present > "$here/nested"; else echo absent > "$here/nested"; fi
-{orphan}{sleep_before}{first}{second}{sleep_after}{sentinel}exit {code}
+{orphan}{sleep_before}{mcp}{first}{second}{sleep_after}{sentinel}exit {code}
 "#,
             code = self.exit_code
         );
@@ -449,5 +469,79 @@ if [ -n "${{CLAUDECODE+set}}" ]; then echo present > "$here/nested"; else echo a
             .expect("make the fake executable");
 
         FakeClaude { dir }
+    }
+}
+
+/// The shell that makes the fake call tools on the bridge over MCP.
+///
+/// Streamable HTTP MCP needs an `initialize` round trip before a
+/// `tools/call`; the session id comes back in a header and must be echoed.
+/// Everything here is POST-and-parse with curl and sed, so the fake stays a
+/// plain shell script. Empty when there is nothing to call.
+fn mcp_script(calls: &[(String, String)]) -> String {
+    use std::fmt::Write as _;
+
+    if calls.is_empty() {
+        return String::new();
+    }
+    let mut script = String::from(
+        r#"url=$(printf '%s\n' "$mcp_config" | sed -n 's/.*"url":"\([^"]*\)".*/\1/p')
+if [ -n "$url" ] && [ -n "$first_spawn" ]; then
+  hdrs=$(mktemp)
+  curl -s -D "$hdrs" -o /dev/null -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fake-claude","version":"0"}}}' "$url"
+  sid=$(sed -n 's/^[Mm]cp-[Ss]ession-[Ii]d: *//p' "$hdrs" | tr -d '\r')
+  curl -s -o /dev/null -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -H "Mcp-Session-Id: $sid" \
+    -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' "$url"
+"#,
+    );
+    for (i, (name, args)) in calls.iter().enumerate() {
+        let id = i + 2;
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"{name}","arguments":{args}}}}}"#
+        );
+        // Single quotes inside a single-quoted shell string.
+        let quoted = body.replace('\'', "'\\''");
+        let _ = writeln!(
+            script,
+            "  curl -s -o \"$here/mcp_reply_{i}\" -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -H \"Mcp-Session-Id: $sid\" -d '{quoted}' \"$url\""
+        );
+    }
+    script.push_str("fi\n");
+    script
+}
+
+/// Split a stdout fixture on the pause marker when a pause is wanted, or
+/// strip the marker when it is not, so it never reaches the stream as content.
+fn split_fixture(stdout: &str, paused: bool) -> (String, String) {
+    match (paused, stdout.split_once(PAUSE)) {
+        (true, Some((first, second))) => (first.to_owned(), second.to_owned()),
+        _ => (stdout.replace(PAUSE, ""), String::new()),
+    }
+}
+
+/// The shell that emits stdout: in two halves around a pause, forever on a
+/// timer, or from a grandchild after the child exits.
+///
+/// The split is done in Rust rather than in the script because the awk that
+/// used to do it relied on `RT`, a gawk extension Ubuntu's mawk never sets.
+fn emit_stdout_script(
+    delay_mid: Option<f32>,
+    repeat_forever: Option<f32>,
+    orphan_writes_after: Option<f32>,
+) -> String {
+    let base = match delay_mid {
+        Some(seconds) => {
+            format!("cat \"$here/stdout\"\nsleep {seconds}\ncat \"$here/stdout2\"\n")
+        }
+        None => "cat \"$here/stdout\"\n".to_owned(),
+    };
+    let base = match repeat_forever {
+        Some(interval) => format!("while :; do {base}sleep {interval}; done\n"),
+        None => base,
+    };
+    match orphan_writes_after {
+        Some(seconds) => format!("( sleep {seconds}; cat \"$here/stdout\" ) &\n"),
+        None => base,
     }
 }

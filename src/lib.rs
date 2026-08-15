@@ -79,6 +79,7 @@
 
 #![forbid(unsafe_code)]
 
+mod bridge;
 mod client;
 mod model;
 pub mod models;

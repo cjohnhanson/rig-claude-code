@@ -234,15 +234,17 @@ fn portable_schema(schema: &rig_core::schemars::Schema) -> serde_json::Value {
     value
 }
 
+/// Whether this request should advertise its tools to the CLI.
+///
+/// Tools are advertised through a per-turn MCP server (see the `bridge`
+/// module). `ToolChoice::None` is the one way to carry tool definitions and
+/// keep them from the model, and it is honored by not starting the bridge.
+pub(crate) fn advertises_tools(request: &CompletionRequest) -> bool {
+    !request.tools.is_empty() && !matches!(request.tool_choice, Some(ToolChoice::None))
+}
+
 /// Reject request settings the CLI has no way to express.
 fn reject_unsupported(request: &CompletionRequest) -> Result<(), CompletionError> {
-    if !request.tools.is_empty() {
-        return unsupported(
-            "tool definitions",
-            "the CLI accepts no tool definitions as arguments; its route to \
-             tools is MCP, reachable through ClaudeCodeModel::with_mcp_config",
-        );
-    }
     if request.temperature.is_some() {
         return unsupported("temperature", "the CLI has no temperature flag");
     }
@@ -255,16 +257,18 @@ fn reject_unsupported(request: &CompletionRequest) -> Result<(), CompletionError
             "the CLI takes no provider-specific request body",
         );
     }
-    // `ToolChoice::None` is the one variant this transport honors, and it
-    // honors it by construction: no tools are ever advertised. Every other
-    // variant asks for a call that cannot happen.
+    // The CLI's own harness decides whether the model calls a tool. `Auto`
+    // is that state, and `None` withholds the tools entirely, so both are
+    // honored. `Required` and `Specific` would ask the crate to force a call
+    // the CLI does not let it force, so they are refused rather than
+    // silently treated as `Auto`.
     match request.tool_choice {
-        None | Some(ToolChoice::None) => {}
+        None | Some(ToolChoice::None | ToolChoice::Auto) => {}
         Some(_) => {
             return unsupported(
-                "a tool choice other than None",
-                "no tools are advertised, so any other choice asks for a call \
-                 that cannot happen",
+                "a tool choice of Required or Specific",
+                "the CLI's harness decides whether the model calls a tool; only \
+                 Auto and None can be honored",
             );
         }
     }
@@ -284,14 +288,17 @@ fn unsupported<T>(setting: &'static str, reason: &'static str) -> Result<T, Comp
 /// [`Message::System`] in the history, which is where rig has put an agent's
 /// preamble since 0.33.
 fn render_system(request: &CompletionRequest) -> Option<String> {
-    let mut parts: Vec<&str> = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
     if let Some(preamble) = request.preamble.as_deref() {
-        parts.push(preamble);
+        parts.push(preamble.to_owned());
     }
     for message in request.chat_history.iter() {
         if let Message::System { content } = message {
-            parts.push(content);
+            parts.push(content.clone());
         }
+    }
+    if advertises_tools(request) {
+        parts.push(TOOL_INSTRUCTIONS.to_owned());
     }
     if parts.is_empty() {
         None
@@ -299,6 +306,19 @@ fn render_system(request: &CompletionRequest) -> Option<String> {
         Some(parts.join("\n\n"))
     }
 }
+
+/// Appended to the system prompt whenever tools are advertised.
+///
+/// The CLI's own harness runs the tools, and each returns a placeholder. The
+/// model must not read that placeholder as an answer, and it must not try to
+/// answer without the real result. The turn ends when the model has made
+/// its calls; rig runs them and comes back.
+const TOOL_INSTRUCTIONS: &str = "\
+Tools are available to you through the `rig` MCP server. When a tool is the \
+right way to proceed, call it. Each call returns an acknowledgement, not its \
+result: the harness runs the call afterwards and gives you the real result \
+on the next turn. After you have made the calls you need, stop and reply \
+briefly. Do not guess what a call would have returned.";
 
 /// Flatten the request into the single prompt the CLI reads from stdin.
 ///
@@ -434,7 +454,7 @@ fn user_text(content: &OneOrMany<UserContent>) -> String {
             UserContent::Audio(_) => omitted("an audio clip"),
             UserContent::Video(_) => omitted("a video"),
             UserContent::Document(_) => omitted("a document"),
-            UserContent::ToolResult(_) => omitted("a tool result"),
+            UserContent::ToolResult(result) => tool_result_text(result),
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -446,14 +466,34 @@ fn assistant_text(content: &OneOrMany<AssistantContent>) -> String {
         .iter()
         .map(|block| match block {
             AssistantContent::Text(text) => text.text.clone(),
-            AssistantContent::ToolCall(call) => {
-                format!("[a tool call to {} was omitted]", call.function.name)
-            }
+            AssistantContent::ToolCall(call) => format!(
+                "[called {} with {} as call {}]",
+                call.function.name, call.function.arguments, call.id
+            ),
             AssistantContent::Reasoning(_) => omitted("a reasoning block"),
             AssistantContent::Image(_) => omitted("an image"),
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Render a tool result so the model sees what its call returned.
+///
+/// The call and its result are the two halves of the tool loop. rig runs the
+/// tool and appends the result to history; the next turn must carry it, or
+/// the model asks for the same call again until the turn budget runs out.
+fn tool_result_text(result: &rig_core::message::ToolResult) -> String {
+    let body = result
+        .content
+        .iter()
+        .map(|item| match item {
+            rig_core::message::ToolResultContent::Text(text) => text.text.clone(),
+            rig_core::message::ToolResultContent::Json { value } => value.to_string(),
+            rig_core::message::ToolResultContent::Image(_) => omitted("an image"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("[result of call {}] {body}", result.id)
 }
 
 /// The placeholder left in place of content the transport cannot carry.
@@ -894,7 +934,7 @@ mod tests {
                     "call-1",
                     OneOrMany::one(rig_core::message::ToolResultContent::text("42")),
                 ),
-                "[a tool result was omitted",
+                "[result of call call-1] 42",
             ),
         ];
 
@@ -905,8 +945,55 @@ mod tests {
             });
             let stdin = spec_for(&req).stdin;
             assert!(stdin.contains(expected), "{expected} not in {stdin}");
-            assert!(stdin.contains("sends text only"), "{stdin}");
         }
+    }
+
+    #[test]
+    fn a_tool_result_carries_its_call_id_and_body() {
+        // The call and its result are the two halves of the tool loop. If the
+        // result did not reach the model, it would ask for the same call
+        // again until the turn budget ran out.
+        let mut req = request("ignored");
+        req.chat_history = OneOrMany::many(vec![
+            Message::user("price?"),
+            Message::Assistant {
+                id: None,
+                content: OneOrMany::one(AssistantContent::tool_call(
+                    "c1",
+                    "lookup_price",
+                    serde_json::json!({"sku": "A-113"}),
+                )),
+            },
+            Message::User {
+                content: OneOrMany::one(UserContent::tool_result(
+                    "c1",
+                    OneOrMany::one(rig_core::message::ToolResultContent::text("$14.20")),
+                )),
+            },
+            Message::user("so?"),
+        ])
+        .unwrap();
+        let stdin = spec_for(&req).stdin;
+        assert!(
+            stdin.contains(r#"[called lookup_price with {"sku":"A-113"} as call c1]"#),
+            "{stdin}"
+        );
+        assert!(stdin.contains("[result of call c1] $14.20"), "{stdin}");
+    }
+
+    #[test]
+    fn a_json_tool_result_is_rendered_as_json() {
+        let result = rig_core::message::ToolResult {
+            id: "c9".to_owned(),
+            call_id: None,
+            content: OneOrMany::one(rig_core::message::ToolResultContent::Json {
+                value: serde_json::json!({"price": 14.2}),
+            }),
+        };
+        assert_eq!(
+            tool_result_text(&result),
+            r#"[result of call c9] {"price":14.2}"#
+        );
     }
 
     #[test]
@@ -942,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    fn marks_an_omitted_tool_call_with_its_name() {
+    fn renders_a_tool_call_with_its_name_arguments_and_id() {
         let mut req = request("ignored");
         req.chat_history = OneOrMany::many(vec![
             Message::Assistant {
@@ -959,7 +1046,7 @@ mod tests {
         let stdin = spec_for(&req).stdin;
         assert!(stdin.contains(": let me add those"), "{stdin}");
         assert!(
-            stdin.contains("[a tool call to add was omitted]"),
+            stdin.contains(r#"[called add with {"a":1} as call call-1]"#),
             "{stdin}"
         );
     }
@@ -1043,16 +1130,37 @@ mod tests {
     }
 
     #[test]
-    fn rejects_tool_definitions() {
+    fn a_request_with_tools_advertises_them_and_instructs_the_model() {
         let mut req = request("hi");
         req.tools = vec![rig_core::completion::ToolDefinition {
             name: "add".to_owned(),
             description: "adds".to_owned(),
             parameters: serde_json::json!({}),
         }];
-        let error = error_for(&req);
-        assert_eq!(refusal(&error).map(|r| r.setting), Some("tool definitions"));
-        assert!(error.to_string().contains("MCP"), "{error}");
+        assert!(advertises_tools(&req));
+        let spec = spec_for(&req);
+        let system = spec.system_prompt.expect("tools add instructions");
+        assert!(system.contains("rig` MCP server"), "{system}");
+        assert!(system.contains("Do not guess"), "{system}");
+    }
+
+    #[test]
+    fn tool_choice_none_withholds_the_tools() {
+        let mut req = request("hi");
+        req.tools = vec![rig_core::completion::ToolDefinition {
+            name: "add".to_owned(),
+            description: "adds".to_owned(),
+            parameters: serde_json::json!({}),
+        }];
+        req.tool_choice = Some(ToolChoice::None);
+        assert!(!advertises_tools(&req));
+        assert_eq!(spec_for(&req).system_prompt, None);
+    }
+
+    #[test]
+    fn a_request_without_tools_adds_no_tool_instructions() {
+        assert!(!advertises_tools(&request("hi")));
+        assert_eq!(spec_for(&request("hi")).system_prompt, None);
     }
 
     #[test]
@@ -1086,19 +1194,20 @@ mod tests {
     }
 
     #[test]
-    fn accepts_the_one_tool_choice_it_can_honor() {
-        let mut req = request("hi");
-        req.tool_choice = Some(ToolChoice::None);
-        assert!(
-            build("haiku", &req, Mode::Blocking).is_ok(),
-            "None is satisfied by advertising no tools"
-        );
+    fn accepts_the_tool_choices_the_cli_can_honor() {
+        for choice in [ToolChoice::None, ToolChoice::Auto] {
+            let mut req = request("hi");
+            req.tool_choice = Some(choice.clone());
+            assert!(
+                build("haiku", &req, Mode::Blocking).is_ok(),
+                "{choice:?} is honored"
+            );
+        }
     }
 
     #[test]
-    fn rejects_every_tool_choice_it_cannot_honor() {
+    fn rejects_the_tool_choices_it_cannot_force() {
         for choice in [
-            ToolChoice::Auto,
             ToolChoice::Required,
             ToolChoice::Specific {
                 function_names: vec!["add".to_owned()],
@@ -1109,8 +1218,8 @@ mod tests {
             let error = error_for(&req);
             assert_eq!(
                 refusal(&error).map(|r| r.setting),
-                Some("a tool choice other than None"),
-                "{choice:?} asks for a call that cannot happen"
+                Some("a tool choice of Required or Specific"),
+                "{choice:?} would ask the crate to force a call the CLI decides"
             );
         }
     }
