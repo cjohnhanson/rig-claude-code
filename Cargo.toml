@@ -5,25 +5,33 @@ edition = "2024"
 # 1.88 stabilized let chains on edition 2024, which src/streaming.rs uses.
 rust-version = "1.88"
 license = "MIT"
-description = "A rig completion model backed by the Claude Code CLI, authenticated by a Claude subscription instead of an API key."
+description = "Unofficial rig completion model backed by the Claude Code CLI, authenticated by a Claude subscription instead of an API key."
 repository = "https://github.com/cjohnhanson/rig-claude-code"
+documentation = "https://docs.rs/rig-claude-code"
+homepage = "https://github.com/cjohnhanson/rig-claude-code"
 readme = "README.md"
 keywords = ["rig", "claude", "llm", "agent", "anthropic"]
 categories = ["api-bindings", "asynchronous"]
 
 [dependencies]
 async-stream = "0.3.6"
-futures = "0.3.34"
-rig-core = "0.41"
+# No default features: this crate makes no HTTP requests and uses no derive
+# macros, so it must not pin a TLS backend for applications that wanted a
+# different one.
+rig-core = { version = "0.41", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3.27.0"
 thiserror = "2"
 tokio = { version = "1", features = ["process", "io-util", "rt"] }
 
 [dev-dependencies]
 futures = "0.3.34"
 rig = "0.41"
-rig-core = "0.41"
+# No default features: this crate makes no HTTP requests and uses no derive
+# macros, so it must not pin a TLS backend for applications that wanted a
+# different one.
+rig-core = { version = "0.41", default-features = false }
 schemars = "1"
 serde_json = "1"
 tempfile = "3.27.0"

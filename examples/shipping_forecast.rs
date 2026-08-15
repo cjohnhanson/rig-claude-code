@@ -9,7 +9,7 @@ use rig::agent::MultiTurnStreamItem;
 use rig::completion::{Chat, Message, Prompt};
 use rig::prelude::*;
 use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
-use rig_claude_code::ClaudeCodeClient;
+use rig_claude_code::{ClaudeCodeClient, models};
 use std::io::Write as _;
 
 const PREAMBLE: &str = "You write shipping forecasts in the style of the BBC. \
@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("claude {}\n", client.version().await?);
 
     let agent = client
-        .agent("haiku")
+        .agent(models::HAIKU)
         .name("shipping-forecast")
         .preamble(PREAMBLE)
         .build();

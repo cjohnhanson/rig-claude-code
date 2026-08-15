@@ -4,33 +4,52 @@ use std::process::Stdio;
 
 use rig_core::client::ProviderClient;
 use rig_core::client::completion::CompletionClient;
+use rig_core::client::verify::{VerifyClient, VerifyError};
 
 use crate::model::ClaudeCodeModel;
+use crate::response::quote;
 
 /// Environment variable naming the `claude` binary when it is not on `PATH`.
+///
+/// Read by [`ClaudeCodeClient::from_env`] only. [`ClaudeCodeModel::new`]
+/// does not consult it; use [`ClaudeCodeModel::with_binary`] there.
 pub const BINARY_ENV: &str = "RIG_CLAUDE_CODE_BIN";
 
 /// The binary name used when nothing else names one.
 pub const DEFAULT_BINARY: &str = "claude";
 
-/// Failure constructing a [`ClaudeCodeClient`].
+/// Failure constructing or checking a [`ClaudeCodeClient`].
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ClientError {
-    /// The named binary could not be run.
+    /// The named binary could not be started at all.
     #[error("cannot run the claude binary `{binary}`: {source}")]
     BinaryNotRunnable {
         /// The binary that was tried.
         binary: String,
-        /// Why running it failed.
+        /// Why starting it failed.
         source: std::io::Error,
+    },
+
+    /// The binary started and reported failure.
+    ///
+    /// A path that names some other executable produces this rather than
+    /// passing as a working `claude`.
+    #[error("the claude binary `{binary}` exited with {status}: {stderr}")]
+    BinaryFailed {
+        /// The binary that was tried.
+        binary: String,
+        /// Its exit status.
+        status: std::process::ExitStatus,
+        /// A bounded quote of what it wrote to stderr.
+        stderr: String,
     },
 }
 
 /// A provider client for the local `claude` CLI.
 ///
-/// It implements the same traits as any built-in rig provider, so
-/// construction reads the same way:
+/// It implements the same traits as any built-in rig provider, so construction
+/// reads the same way:
 ///
 /// ```no_run
 /// use rig::prelude::*;
@@ -44,9 +63,9 @@ pub enum ClientError {
 /// # }
 /// ```
 ///
-/// There is no API key. The credential is whatever the `claude` CLI is
-/// already logged in with, which for a subscription login means the turn draws
-/// on the subscription's usage limits rather than API credits.
+/// There is no API key. The credential is whatever the `claude` CLI is already
+/// logged in with, which for a subscription login means the turn draws on the
+/// subscription's usage limits rather than API credits.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClaudeCodeClient {
     binary: String,
@@ -55,6 +74,9 @@ pub struct ClaudeCodeClient {
 impl ClaudeCodeClient {
     /// Use a specific binary path, without consulting the environment and
     /// without checking that it runs.
+    ///
+    /// The binary runs with this process's full privileges, so its path is
+    /// trusted configuration.
     #[must_use]
     pub fn new(binary: impl Into<String>) -> Self {
         Self {
@@ -73,17 +95,28 @@ impl ClaudeCodeClient {
     /// # Errors
     ///
     /// Returns [`ClientError::BinaryNotRunnable`] when the binary cannot be
-    /// executed.
+    /// started, and [`ClientError::BinaryFailed`] when it starts and exits
+    /// non-zero — which is what a path naming some other executable does.
     pub async fn version(&self) -> Result<String, ClientError> {
         let output = tokio::process::Command::new(&self.binary)
             .arg("--version")
             .stdin(Stdio::null())
+            .kill_on_drop(true)
             .output()
             .await
             .map_err(|source| ClientError::BinaryNotRunnable {
                 binary: self.binary.clone(),
                 source,
             })?;
+
+        if !output.status.success() {
+            return Err(ClientError::BinaryFailed {
+                binary: self.binary.clone(),
+                status: output.status,
+                stderr: quote(&output.stderr),
+            });
+        }
+
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     }
 }
@@ -94,29 +127,43 @@ impl ProviderClient for ClaudeCodeClient {
     type Error = ClientError;
 
     /// Resolve the binary from [`BINARY_ENV`], falling back to `PATH`, and
-    /// confirm it runs.
+    /// confirm it runs successfully.
     ///
-    /// Unlike an API-key provider there is no secret to read. The check that
-    /// earns this method its name is that the binary exists at all. Without
-    /// it, a missing binary surfaces one prompt later as a spawn failure
-    /// inside a completion, far from the configuration mistake that caused it.
+    /// Unlike an API-key provider there is no secret to read, so this is what
+    /// the method checks instead. Without it, a missing or wrong binary
+    /// surfaces one prompt later as a spawn failure inside a completion, far
+    /// from the configuration mistake that caused it.
+    ///
+    /// This runs the binary synchronously, which parks the calling thread for
+    /// as long as `claude --version` takes. The trait signature is sync, so
+    /// there is no way around it; call it during setup rather than on a hot
+    /// async path, or use [`ClaudeCodeClient::new`] and
+    /// [`ClaudeCodeClient::version`] to do the same check without blocking.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError::BinaryNotRunnable`] when the resolved binary
-    /// cannot be executed.
+    /// cannot be started, and [`ClientError::BinaryFailed`] when it starts and
+    /// exits non-zero.
     fn from_env() -> Result<Self, Self::Error> {
         let binary = std::env::var(BINARY_ENV).unwrap_or_else(|_| DEFAULT_BINARY.to_owned());
-        std::process::Command::new(&binary)
+        let output = std::process::Command::new(&binary)
             .arg("--version")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+            .output()
             .map_err(|source| ClientError::BinaryNotRunnable {
                 binary: binary.clone(),
                 source,
             })?;
+
+        if !output.status.success() {
+            return Err(ClientError::BinaryFailed {
+                binary,
+                status: output.status,
+                stderr: quote(&output.stderr),
+            });
+        }
+
         Ok(Self { binary })
     }
 
@@ -126,12 +173,32 @@ impl ProviderClient for ClaudeCodeClient {
     ///
     /// Never fails; the signature is fixed by the trait.
     fn from_val(input: Self::Input) -> Result<Self, Self::Error> {
-        Ok(Self { binary: input })
+        Ok(Self::new(input))
     }
 }
 
 impl CompletionClient for ClaudeCodeClient {
     type CompletionModel = ClaudeCodeModel;
+}
+
+impl VerifyClient for ClaudeCodeClient {
+    /// Check that the CLI is present and working.
+    ///
+    /// This is the trait generic rig code reaches for, so a caller that
+    /// verifies every provider before use works here too. It confirms the
+    /// binary runs; it does not confirm the CLI is logged in, which only a
+    /// real turn can establish.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VerifyError::ProviderError`] when the binary is missing or
+    /// exits non-zero.
+    async fn verify(&self) -> Result<(), VerifyError> {
+        self.version()
+            .await
+            .map(|_| ())
+            .map_err(|error| VerifyError::ProviderError(error.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -141,8 +208,7 @@ mod tests {
 
     #[test]
     fn keeps_the_binary_it_was_given() {
-        let client = ClaudeCodeClient::new("/opt/claude");
-        assert_eq!(client.binary(), "/opt/claude");
+        assert_eq!(ClaudeCodeClient::new("/opt/claude").binary(), "/opt/claude");
     }
 
     #[test]
@@ -157,14 +223,5 @@ mod tests {
         let model = client.completion_model("haiku");
         assert_eq!(model.binary(), "/opt/claude");
         assert_eq!(model.model(), "haiku");
-    }
-
-    #[test]
-    fn reports_an_unrunnable_binary_by_name() {
-        let error = ClientError::BinaryNotRunnable {
-            binary: "/nowhere/claude".to_owned(),
-            source: std::io::Error::from(std::io::ErrorKind::NotFound),
-        };
-        assert!(error.to_string().contains("/nowhere/claude"), "{error}");
     }
 }

@@ -37,35 +37,53 @@
 //! # What the transport cannot do
 //!
 //! The CLI takes a prompt, a system prompt, a model, and an output schema. It
-//! takes no tool definitions and no sampling parameters. Each unsupported
-//! setting is **rejected with an error** rather than dropped, because a
-//! silently ignored `max_tokens` is harder to diagnose than a refused request:
+//! takes no tool definitions and no sampling parameters. Every unsupported
+//! *request setting* is rejected with an error rather than dropped, because a
+//! silently ignored `max_tokens` is harder to diagnose than a refused request.
+//! The cause is an [`UnsupportedSetting`], so a caller can `downcast_ref` and
+//! fall back to another provider rather than match on message text.
 //!
-//! - **Tools.** Registering rig tools fails. The CLI's route to tools is MCP;
-//!   an agent that needs them wants a different transport, or an MCP server
-//!   and `--mcp-config`. This also rules out `OutputMode::Tool`, and so the
-//!   [`ExtractorBuilder`](https://docs.rs/rig-core/latest/rig/) path, which
-//!   uses a synthetic `submit` tool. Use `OutputMode::Native` on a plain
-//!   agent for structured output instead.
+//! - **Tools.** Registering rig tools fails. The CLI's route to tools is MCP,
+//!   reachable through [`ClaudeCodeModel::with_mcp_config`]. That also rules
+//!   out `OutputMode::Tool` and rig's extractor, both of which use a synthetic
+//!   `submit` tool — use a plain agent, whose default `OutputMode::Auto`
+//!   already resolves to native structured output when no tools are present.
 //! - **`temperature` and `max_tokens`.** No CLI flags exist.
 //! - **`additional_params`.** There is no request body to extend.
+//! - **A `tool_choice` other than `None`.** No tools are advertised.
 //!
-//! # Cost of the default invocation
+//! Message content is text. An image, audio clip, video, document block, or
+//! tool result is replaced by a visible placeholder rather than dropped
+//! silently, so the model knows something was left out.
+//!
+//! # Cost, safety, and process lifetime
 //!
 //! A plain `claude -p` loads the full Claude Code agent system prompt, the
-//! project's `CLAUDE.md`, configured MCP servers, and skills. Measured against
-//! Claude Code 2.1.233, a one-word prompt costs about 42,000 input tokens that
-//! way. This crate passes the flags that strip all of it, which brings the
-//! same prompt to about 165.
+//! project's `CLAUDE.md`, configured MCP servers, and skills — about 42,000
+//! input tokens for a one-word prompt, against about 165 with the flags this
+//! crate passes. Neither the prompt nor the system prompt travels in argv; see
+//! the `request` module's documentation for why, and the README for the trust
+//! model around `PATH` and `RIG_CLAUDE_CODE_BIN`.
+//!
+//! Every turn is one child process, killed when the future or stream driving
+//! it is dropped. There is no default timeout; see
+//! [`ClaudeCodeModel::with_timeout`].
 
 #![forbid(unsafe_code)]
 
 mod client;
 mod model;
+pub mod models;
 mod request;
 mod response;
 mod streaming;
 
+/// Compiles the README's examples as doctests, so they cannot rot.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+mod readme {}
+
 pub use client::{BINARY_ENV, ClaudeCodeClient, ClientError, DEFAULT_BINARY};
 pub use model::ClaudeCodeModel;
-pub use response::{CliResult, CliUsage, OutputTokenDetails};
+pub use request::UnsupportedSetting;
+pub use response::{CliResponse, CliUsage, OutputTokenDetails};

@@ -8,6 +8,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # RUSTFLAGS does not reach rustdoc, so a broken intra-doc link would pass CI
+  # without this.
+  RUSTDOCFLAGS: -D warnings
 
 jobs:
   test:
@@ -23,9 +26,11 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets
-      - run: cargo test
-      - run: cargo doc --no-deps
+      - run: cargo clippy --all-targets --locked
+      - run: cargo test --locked
+      - run: cargo doc --no-deps --locked
+      # A rig-core patch release can break the build with no change here.
+      - run: cargo package --locked
 
   msrv:
     runs-on: ubuntu-latest

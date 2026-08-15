@@ -1,31 +1,35 @@
 //! End-to-end tests against a scripted stand-in for the `claude` binary.
 //!
-//! These exercise the parts a unit test cannot reach: process spawning, the
-//! argument vector as the operating system actually receives it, the child's
-//! environment, exit-status handling, and the agent runtime driving the model.
+//! These exercise what a unit test cannot reach: process spawning, the
+//! argument vector as the operating system receives it, what crosses the
+//! standard input pipe, exit-status handling, process lifetime, and the agent
+//! runtime driving the model.
 //!
-//! The fake is a shell script, so the suite is Unix-only. The library itself
-//! is not.
+//! The stand-in is a shell script, so the suite is Unix-only. The library is
+//! not. Tests that mutate the environment live in `tests/environment.rs`,
+//! which cargo compiles into its own binary — `set_var` races against any
+//! concurrent `spawn` in the same process, and every test here spawns.
 
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
 
-use common::FakeClaude;
+use std::time::Duration;
+
+use common::{FakeClaude, PAUSE};
+use futures::StreamExt as _;
 use rig::completion::{Chat, Message, Prompt};
 use rig::prelude::*;
-use rig_claude_code::{ClaudeCodeClient, ClaudeCodeModel};
+use rig_claude_code::{ClaudeCodeClient, ClaudeCodeModel, CliResponse, UnsupportedSetting};
 use rig_core::OneOrMany;
-use rig_core::completion::{CompletionModel, CompletionRequest};
+use rig_core::completion::{AssistantContent, CompletionModel, CompletionRequest};
+use rig_core::streaming::{StreamedAssistantContent, StreamingCompletionResponse};
 
 /// A minimal envelope carrying `text`.
 fn envelope(text: &str) -> String {
     format!(
-        r#"{{"is_error":false,"subtype":"success","result":"{text}","session_id":"s-42",
-            "usage":{{"input_tokens":11,"output_tokens":5,"cache_read_input_tokens":1,
-                      "cache_creation_input_tokens":2,
-                      "output_tokens_details":{{"thinking_tokens":3}}}}}}"#
+        r#"{{"is_error":false,"subtype":"success","result":"{text}","session_id":"s-42","usage":{{"input_tokens":11,"output_tokens":5,"cache_read_input_tokens":1,"cache_creation_input_tokens":2,"output_tokens_details":{{"thinking_tokens":3}}}}}}"#
     )
 }
 
@@ -45,6 +49,15 @@ fn request(prompt: &str) -> CompletionRequest {
     }
 }
 
+fn text_of(response: &rig_core::completion::CompletionResponse<CliResponse>) -> String {
+    match response.choice.first() {
+        AssistantContent::Text(text) => text.text.clone(),
+        other => panic!("expected text, got {other:?}"),
+    }
+}
+
+// --- blocking --------------------------------------------------------------
+
 #[tokio::test]
 async fn returns_the_assistant_text() {
     let fake = FakeClaude::printing(&envelope("pong"));
@@ -52,10 +65,7 @@ async fn returns_the_assistant_text() {
 
     let response = model.completion(request("ping")).await.unwrap();
 
-    match response.choice.first() {
-        rig_core::completion::AssistantContent::Text(text) => assert_eq!(text.text, "pong"),
-        other => panic!("expected text, got {other:?}"),
-    }
+    assert_eq!(text_of(&response), "pong");
 }
 
 #[tokio::test]
@@ -75,13 +85,62 @@ async fn reports_token_usage() {
 }
 
 #[tokio::test]
-async fn passes_the_prompt_as_the_final_argument() {
+async fn sends_the_prompt_on_standard_input() {
     let fake = FakeClaude::printing(&envelope("ok"));
     let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
 
     model.completion(request("the prompt")).await.unwrap();
 
-    assert_eq!(fake.argv().last().map(String::as_str), Some("the prompt"));
+    assert_eq!(fake.stdin(), "the prompt");
+    assert!(
+        !fake.argv().iter().any(|arg| arg.contains("the prompt")),
+        "argv is world-readable through ps: {:?}",
+        fake.argv()
+    );
+}
+
+#[tokio::test]
+async fn a_flag_shaped_prompt_crosses_the_boundary_as_the_prompt() {
+    // Verified against Claude Code 2.1.233: as a positional argument,
+    // `--settings={"hooks":…"command":"touch /tmp/proof"…}` executed that
+    // command as the host user, before any API call.
+    let hostile = r#"--settings={"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"touch /tmp/rcc-proof"}]}]}}"#;
+    let fake = FakeClaude::printing(&envelope("ok"));
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    model.completion(request(hostile)).await.unwrap();
+
+    assert_eq!(fake.stdin(), hostile);
+    assert!(
+        !fake.argv().iter().any(|arg| arg.contains("--settings")),
+        "{:?}",
+        fake.argv()
+    );
+}
+
+#[tokio::test]
+async fn a_flag_shaped_system_prompt_goes_to_a_private_file() {
+    // The CLI scans raw argv for `--settings=` ahead of its own option
+    // parsing, so the payload fires from an option *value* too.
+    let hostile = r#"--settings={"hooks":{"SessionStart":[]}}"#;
+    let fake = FakeClaude::printing(&envelope("ok"));
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let mut req = request("hi");
+    req.preamble = Some(hostile.to_owned());
+    model.completion(req).await.unwrap();
+
+    assert_eq!(fake.system_prompt().as_deref(), Some(hostile));
+    assert!(
+        !fake.argv().iter().any(|arg| arg.contains("--settings")),
+        "{:?}",
+        fake.argv()
+    );
+    assert_eq!(
+        fake.system_prompt_mode(),
+        Some(0o600),
+        "the system prompt can hold anything the caller put in a preamble"
+    );
 }
 
 #[tokio::test]
@@ -109,36 +168,10 @@ async fn passes_the_lean_flags() {
 }
 
 #[tokio::test]
-async fn a_flag_like_prompt_reaches_the_child_as_the_prompt() {
-    // Verified against Claude Code 2.1.233: without the `--` separator,
-    // `claude -p '--version'` prints its version and never answers the
-    // prompt. Prompt text is attacker-influenceable in most deployments, so
-    // a prompt of `--dangerously-skip-permissions` must not become a flag.
-    let fake = FakeClaude::printing(&envelope("ok"));
-    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
-
-    model
-        .completion(request("--dangerously-skip-permissions"))
-        .await
-        .unwrap();
-
-    let argv = fake.argv();
-    let separator = argv
-        .iter()
-        .position(|arg| arg == "--")
-        .expect("an argument separator must precede the prompt");
-    assert_eq!(
-        argv.get(separator + 1).map(String::as_str),
-        Some("--dangerously-skip-permissions")
-    );
-    assert_eq!(separator + 2, argv.len(), "nothing may follow the prompt");
-}
-
-#[tokio::test]
 async fn preserves_an_empty_argument_through_the_process_boundary() {
     // `--tools ""` only strips the built-in tools if the empty string survives
-    // as its own argument. A shell-quoting mistake would silently drop it and
-    // leave every built-in tool enabled.
+    // as its own argument. A quoting mistake would silently drop it and leave
+    // every built-in tool enabled.
     let fake = FakeClaude::printing(&envelope("ok"));
     let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
 
@@ -155,49 +188,62 @@ async fn preserves_an_empty_argument_through_the_process_boundary() {
 }
 
 #[tokio::test]
-async fn removes_the_nested_session_marker() {
+async fn runs_the_binary_exactly_once_per_turn() {
     let fake = FakeClaude::printing(&envelope("ok"));
     let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
 
-    // Deliberate: this mutates process-wide state. The assertion is that the
-    // marker does not reach the child even when this process has it set. The
-    // library forbids unsafe; the test harness does not.
-    let _guard = ENV_LOCK.lock().await;
-    #[allow(unsafe_code)]
-    unsafe {
-        std::env::set_var("CLAUDECODE", "1");
-    }
-    let result = model.completion(request("hi")).await;
-    #[allow(unsafe_code)]
-    unsafe {
-        std::env::remove_var("CLAUDECODE");
-    }
-    result.unwrap();
+    model.completion(request("hi")).await.unwrap();
 
-    assert!(
-        !fake.saw_nested_marker(),
-        "CLAUDECODE must be stripped from the child environment"
-    );
+    assert_eq!(fake.spawn_count(), 1);
 }
 
 #[tokio::test]
-async fn passes_a_preamble_as_the_system_prompt() {
+async fn carries_a_prompt_far_larger_than_the_argument_limit() {
+    // Linux caps a single argument at 128 KiB. A flattened transcript passes
+    // that easily, and as an argument it fails with E2BIG — reported as a
+    // spawn error that reads like a missing binary.
+    let huge = "x".repeat(400 * 1024);
     let fake = FakeClaude::printing(&envelope("ok"));
     let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
 
-    let mut req = request("hi");
-    req.preamble = Some("Be terse.".to_owned());
-    model.completion(req).await.unwrap();
+    let response = model.completion(request(&huge)).await.unwrap();
 
-    assert_eq!(
-        fake.value_after("--system-prompt").as_deref(),
-        Some("Be terse.")
-    );
+    assert_eq!(text_of(&response), "ok");
+    assert_eq!(fake.stdin().len(), huge.len());
 }
 
 #[tokio::test]
-async fn surfaces_a_non_zero_exit_with_its_stderr() {
-    let fake = FakeClaude::failing("credit balance too low", 3);
+async fn a_child_that_floods_stderr_first_does_not_deadlock() {
+    // The parent must drain both pipes concurrently. Draining stdout to the
+    // end before touching stderr blocks forever once the child fills the
+    // stderr pipe, which is 64 KiB on most systems.
+    let flood = "e".repeat(2 * 1024 * 1024);
+    let fake = FakeClaude::builder()
+        .stdout(&envelope("ok"))
+        .stderr(&flood)
+        .stderr_first()
+        .build();
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let response = tokio::time::timeout(Duration::from_secs(20), model.completion(request("hi")))
+        .await
+        .expect("a concurrent drain finishes; a sequential one hangs")
+        .unwrap();
+
+    assert_eq!(text_of(&response), "ok");
+}
+
+#[tokio::test]
+async fn a_failed_turn_is_reported_from_its_envelope_not_its_exit_status() {
+    // The CLI reports a usage limit, a rate limit, or an unrecognized model as
+    // a well-formed envelope on stdout *and* exit 1, with stderr empty or
+    // holding only an internal code. Checking the status first discards the
+    // only readable explanation.
+    let fake = FakeClaude::builder()
+        .stdout(r#"{"is_error":true,"subtype":"success","result":"Claude AI usage limit reached"}"#)
+        .stderr("[claude-code:internal] {}")
+        .exit_code(1)
+        .build();
     let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
 
     let error = model
@@ -206,7 +252,21 @@ async fn surfaces_a_non_zero_exit_with_its_stderr() {
         .unwrap_err()
         .to_string();
 
-    assert!(error.contains("credit balance too low"), "{error}");
+    assert!(error.contains("usage limit reached"), "{error}");
+}
+
+#[tokio::test]
+async fn a_non_zero_exit_with_no_envelope_reports_its_stderr() {
+    let fake = FakeClaude::failing("something went wrong", 3);
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let error = model
+        .completion(request("hi"))
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("something went wrong"), "{error}");
     assert!(error.contains("exited with"), "{error}");
 }
 
@@ -225,6 +285,18 @@ async fn surfaces_a_failed_turn_envelope() {
 
     assert!(error.contains("error_during_execution"), "{error}");
     assert!(error.contains("tool loop"), "{error}");
+}
+
+#[tokio::test]
+async fn tolerates_a_warning_line_ahead_of_the_envelope() {
+    let mut stdout = String::from("Warning: a future deprecation\n");
+    stdout.push_str(&envelope("ok"));
+    let fake = FakeClaude::printing(&stdout);
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let response = model.completion(request("hi")).await.unwrap();
+
+    assert_eq!(text_of(&response), "ok");
 }
 
 #[tokio::test]
@@ -258,6 +330,102 @@ async fn surfaces_a_missing_binary() {
 }
 
 #[tokio::test]
+async fn a_timeout_kills_a_slow_child() {
+    let fake = FakeClaude::builder()
+        .stdout(&envelope("too late"))
+        .delay_before(Duration::from_secs(30))
+        .build();
+    let model = ClaudeCodeModel::new("haiku")
+        .with_binary(fake.path())
+        .with_timeout(Duration::from_millis(300));
+
+    let error = model
+        .completion(request("hi"))
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("did not finish within"), "{error}");
+    assert!(error.contains("was killed"), "{error}");
+}
+
+#[tokio::test]
+async fn dropping_a_turn_kills_the_child() {
+    // Without `kill_on_drop`, an abandoned turn leaves a `claude` running that
+    // still spends the login's usage, with nothing left to reap it. Under a
+    // server workload they accumulate.
+    let fake = FakeClaude::builder()
+        .stdout(&envelope("ok"))
+        .sentinel_after(Duration::from_millis(700))
+        .build();
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    // A short timeout polls the future far enough to spawn the child, then
+    // drops it.
+    let abandoned =
+        tokio::time::timeout(Duration::from_millis(100), model.completion(request("hi"))).await;
+    assert!(abandoned.is_err(), "the turn should still be running");
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(
+        !fake.sentinel_exists(),
+        "the child outlived the dropped turn"
+    );
+}
+
+#[tokio::test]
+async fn runs_in_the_configured_working_directory() {
+    let fake = FakeClaude::printing(&envelope("ok"));
+    let elsewhere = tempfile::tempdir().unwrap();
+    let model = ClaudeCodeModel::new("haiku")
+        .with_binary(fake.path())
+        .with_current_dir(elsewhere.path().display().to_string());
+
+    model.completion(request("hi")).await.unwrap();
+
+    let recorded = fake.working_dir().unwrap();
+    assert!(
+        std::fs::canonicalize(&recorded).unwrap()
+            == std::fs::canonicalize(elsewhere.path()).unwrap(),
+        "{recorded}"
+    );
+}
+
+#[tokio::test]
+async fn appends_extra_arguments() {
+    let fake = FakeClaude::printing(&envelope("ok"));
+    let model = ClaudeCodeModel::new("haiku")
+        .with_binary(fake.path())
+        .with_mcp_config("/etc/mcp.json");
+
+    model.completion(request("hi")).await.unwrap();
+
+    assert_eq!(
+        fake.value_after("--mcp-config").as_deref(),
+        Some("/etc/mcp.json")
+    );
+}
+
+#[tokio::test]
+async fn refuses_extra_arguments_that_override_the_request() {
+    let fake = FakeClaude::printing(&envelope("ok"));
+    let model = ClaudeCodeModel::new("haiku")
+        .with_binary(fake.path())
+        .with_args(["--model", "opus"]);
+
+    let error = model
+        .completion(request("hi"))
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("is set by rig-claude-code"), "{error}");
+    assert_eq!(fake.spawn_count(), 0, "nothing should have been spawned");
+}
+
+// --- client ---------------------------------------------------------------
+
+#[tokio::test]
 async fn from_val_builds_a_working_client() {
     let fake = FakeClaude::printing(&envelope("ok"));
     let client = ClaudeCodeClient::from_val(fake.path()).unwrap();
@@ -268,65 +436,7 @@ async fn from_val_builds_a_working_client() {
         .await
         .unwrap();
 
-    match response.choice.first() {
-        rig_core::completion::AssistantContent::Text(text) => assert_eq!(text.text, "ok"),
-        other => panic!("expected text, got {other:?}"),
-    }
-}
-
-/// Serializes the tests that mutate process-wide environment variables.
-///
-/// `set_var` is unsafe in edition 2024 precisely because other threads may be
-/// reading the environment. The test binary is multi-threaded, so these tests
-/// take a lock rather than trusting that they happen not to overlap. The lock
-/// is async-aware because it is held across the awaited child process, which
-/// is the whole window during which the variable must stay set.
-static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-#[tokio::test]
-async fn from_env_resolves_the_binary_from_the_environment() {
-    let fake = FakeClaude::printing("2.1.233 (Claude Code)\n");
-    let path = fake.path();
-
-    let client = {
-        let _guard = ENV_LOCK.lock().await;
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::set_var(rig_claude_code::BINARY_ENV, &path);
-        }
-        let client = ClaudeCodeClient::from_env();
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::remove_var(rig_claude_code::BINARY_ENV);
-        }
-        client
-    };
-
-    assert_eq!(client.unwrap().binary(), path);
-}
-
-#[tokio::test]
-async fn from_env_rejects_a_binary_it_cannot_run() {
-    let fake = FakeClaude::printing("");
-    let missing = fake.missing_path().display().to_string();
-
-    let result = {
-        let _guard = ENV_LOCK.lock().await;
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::set_var(rig_claude_code::BINARY_ENV, &missing);
-        }
-        let result = ClaudeCodeClient::from_env();
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::remove_var(rig_claude_code::BINARY_ENV);
-        }
-        result
-    };
-
-    let error = result.unwrap_err().to_string();
-    assert!(error.contains(&missing), "{error}");
-    assert!(error.contains("cannot run the claude binary"), "{error}");
+    assert_eq!(text_of(&response), "ok");
 }
 
 #[tokio::test]
@@ -348,85 +458,44 @@ async fn version_reports_an_unrunnable_binary() {
 }
 
 #[tokio::test]
-async fn drives_an_agent_end_to_end() {
-    let fake = FakeClaude::printing(&envelope("a forecast"));
+async fn version_reports_a_binary_that_exits_non_zero() {
+    // Any executable file used to pass as a working `claude`.
+    let fake = FakeClaude::failing("not the binary you wanted", 1);
     let client = ClaudeCodeClient::new(fake.path());
 
-    let agent = client.agent("haiku").preamble("Be terse.").build();
-    let answer = agent.prompt("Report on Dogger.").await.unwrap();
+    let error = client.version().await.unwrap_err().to_string();
 
-    assert_eq!(answer, "a forecast");
-    assert_eq!(
-        fake.value_after("--system-prompt").as_deref(),
-        Some("Be terse.")
-    );
+    assert!(error.contains("exited with"), "{error}");
+    assert!(error.contains("not the binary you wanted"), "{error}");
 }
 
 #[tokio::test]
-async fn threads_history_through_the_agent() {
-    let fake = FakeClaude::printing(&envelope("second answer"));
+async fn verify_accepts_a_working_binary() {
+    let fake = FakeClaude::printing("2.1.233 (Claude Code)\n");
     let client = ClaudeCodeClient::new(fake.path());
-    let agent = client.agent("haiku").build();
 
-    let mut history = vec![
-        Message::user("first question"),
-        Message::assistant("first answer"),
-    ];
-    let answer = agent.chat("second question", &mut history).await.unwrap();
-
-    assert_eq!(answer, "second answer");
-
-    let prompt = fake.argv().last().cloned().unwrap();
-    assert!(prompt.contains("user: first question"), "{prompt}");
-    assert!(prompt.contains("assistant: first answer"), "{prompt}");
-    assert!(prompt.ends_with("second question"), "{prompt}");
-
-    assert_eq!(
-        history.len(),
-        4,
-        "chat appends the committed user and assistant turns"
-    );
+    assert!(client.verify().await.is_ok());
 }
 
 #[tokio::test]
-async fn an_agent_with_context_documents_sends_them() {
-    let fake = FakeClaude::printing(&envelope("ok"));
+async fn verify_rejects_a_broken_binary() {
+    let fake = FakeClaude::failing("nope", 1);
     let client = ClaudeCodeClient::new(fake.path());
 
-    let agent = client
-        .agent("haiku")
-        .context("a flurbo is a green alien")
-        .build();
-    agent.prompt("what is a flurbo?").await.unwrap();
-
-    let prompt = fake.argv().last().cloned().unwrap();
-    assert!(prompt.contains("a flurbo is a green alien"), "{prompt}");
+    assert!(client.verify().await.is_err());
 }
 
-#[tokio::test]
-async fn an_agent_with_a_tool_fails_with_a_usable_message() {
-    let fake = FakeClaude::printing(&envelope("ok"));
-    let client = ClaudeCodeClient::new(fake.path());
+// --- streaming -------------------------------------------------------------
 
-    let agent = client.agent("haiku").tool(tools::Add).build();
-    let error = agent.prompt("add 2 and 2").await.unwrap_err().to_string();
-
-    assert!(error.contains("tool definitions"), "{error}");
-    assert!(error.contains("--mcp-config"), "{error}");
-}
-
-// --- streaming -----------------------------------------------------------
-
-/// A frame stream that produces `text` in two deltas, after one thinking
-/// delta and the frames a real CLI interleaves.
+/// A frame stream producing `text_a` then `text_b`, after one thinking delta
+/// and the frames a real CLI interleaves.
 fn frame_stream(text_a: &str, text_b: &str) -> String {
     format!(
         r#"{{"type":"system","subtype":"init","session_id":"s-7"}}
 {{"type":"stream_event","event":{{"type":"message_start","message":{{}}}}}}
 {{"type":"stream_event","event":{{"type":"content_block_delta","index":0,"delta":{{"type":"thinking_delta","thinking":"pondering"}}}}}}
 {{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed"}}}}
-{{"type":"stream_event","event":{{"type":"content_block_start","index":1,"content_block":{{"type":"text","text":""}}}}}}
-{{"type":"stream_event","event":{{"type":"content_block_delta","index":1,"delta":{{"type":"text_delta","text":"{text_a}"}}}}}}
+{{"type":"stream_event","event":{{"type":"content_block_delta","index":1,"delta":{{"type":"text_delta","text":"{text_a}"}}}}}}{PAUSE}
 {{"type":"stream_event","event":{{"type":"content_block_delta","index":1,"delta":{{"type":"text_delta","text":"{text_b}"}}}}}}
 {{"type":"stream_event","event":{{"type":"message_stop"}}}}
 {{"type":"result","is_error":false,"subtype":"success","result":"{text_a}{text_b}","session_id":"s-7","usage":{{"input_tokens":8,"output_tokens":4,"output_tokens_details":{{"thinking_tokens":2}}}}}}
@@ -436,11 +505,8 @@ fn frame_stream(text_a: &str, text_b: &str) -> String {
 
 /// Collect a stream's text, reasoning, and terminal error, if any.
 async fn drain(
-    mut stream: rig_core::streaming::StreamingCompletionResponse<rig_claude_code::CliResult>,
+    mut stream: StreamingCompletionResponse<CliResponse>,
 ) -> (String, String, Option<String>) {
-    use futures::StreamExt as _;
-    use rig_core::streaming::StreamedAssistantContent;
-
     let (mut text, mut reasoning, mut failure) = (String::new(), String::new(), None);
     while let Some(item) = stream.next().await {
         match item {
@@ -483,6 +549,38 @@ async fn streams_thinking_as_reasoning() {
 }
 
 #[tokio::test]
+async fn deltas_arrive_before_the_turn_ends() {
+    // Without this, an implementation that buffered every line and yielded
+    // them all at EOF would pass every other streaming test identically.
+    let fake = FakeClaude::builder()
+        .stdout(&frame_stream("first ", "second"))
+        .delay_mid(Duration::from_secs(5))
+        .build();
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let mut stream = model.stream(request("count")).await.unwrap();
+
+    let started = std::time::Instant::now();
+    let mut first_text = None;
+    while first_text.is_none() {
+        let item = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("a delta must arrive while the child is still working")
+            .expect("the stream ended early")
+            .unwrap();
+        if let StreamedAssistantContent::Text(chunk) = item {
+            first_text = Some(chunk.text);
+        }
+    }
+
+    assert_eq!(first_text.as_deref(), Some("first "));
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "the first delta waited for the whole turn"
+    );
+}
+
+#[tokio::test]
 async fn a_stream_asks_for_frames_and_partials() {
     let fake = FakeClaude::printing(&frame_stream("a", "b"));
     let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
@@ -504,8 +602,6 @@ async fn a_stream_asks_for_frames_and_partials() {
 
 #[tokio::test]
 async fn a_stream_carries_usage_on_its_final_response() {
-    use futures::StreamExt as _;
-
     let fake = FakeClaude::printing(&frame_stream("a", "b"));
     let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
 
@@ -516,6 +612,17 @@ async fn a_stream_carries_usage_on_its_final_response() {
     assert_eq!(final_response.usage.input_tokens, 8);
     assert_eq!(final_response.result.as_deref(), Some("ab"));
     assert_eq!(stream.message_id.as_deref(), Some("s-7"));
+}
+
+#[tokio::test]
+async fn a_stream_sends_the_prompt_on_standard_input() {
+    let fake = FakeClaude::printing(&frame_stream("a", "b"));
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let stream = model.stream(request("the prompt")).await.unwrap();
+    drain(stream).await;
+
+    assert_eq!(fake.stdin(), "the prompt");
 }
 
 #[tokio::test]
@@ -551,6 +658,25 @@ async fn a_stream_that_ends_without_a_terminal_frame_fails() {
 }
 
 #[tokio::test]
+async fn a_stream_ignores_frames_after_the_terminal_one() {
+    // Two terminal frames used to tear the result: usage from the first,
+    // identity from the second.
+    let mut frames = frame_stream("a", "b");
+    frames.push_str(
+        "{\"type\":\"result\",\"is_error\":false,\"subtype\":\"success\",\"result\":\"second\",\"session_id\":\"s-99\"}\n",
+    );
+    let fake = FakeClaude::printing(&frames);
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let mut stream = model.stream(request("hi")).await.unwrap();
+    while stream.next().await.is_some() {}
+
+    let final_response = stream.response.as_ref().expect("a final response");
+    assert_eq!(final_response.result.as_deref(), Some("ab"));
+    assert_eq!(stream.message_id.as_deref(), Some("s-7"));
+}
+
+#[tokio::test]
 async fn a_stream_surfaces_a_non_zero_exit_with_its_stderr() {
     let fake = FakeClaude::failing("session limit reached", 1);
     let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
@@ -578,54 +704,213 @@ async fn a_stream_ignores_noise_on_stdout() {
 }
 
 #[tokio::test]
-async fn a_stream_removes_the_nested_session_marker() {
-    let fake = FakeClaude::printing(&frame_stream("a", "b"));
+async fn a_stream_survives_invalid_utf8_and_keeps_its_terminal_frame() {
+    let mut frames: Vec<u8> = b"\xff\xfe not text\n".to_vec();
+    frames.extend_from_slice(frame_stream("ok", "").as_bytes());
+    let fake = FakeClaude::printing(&String::from_utf8_lossy(&frames));
     let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
 
-    // Deliberate: the assertion is that the marker does not reach the child
-    // even when this process has it set. The library forbids unsafe; the test
-    // harness does not.
-    let _guard = ENV_LOCK.lock().await;
-    #[allow(unsafe_code)]
-    unsafe {
-        std::env::set_var("CLAUDECODE", "1");
-    }
     let stream = model.stream(request("hi")).await.unwrap();
-    drain(stream).await;
-    #[allow(unsafe_code)]
-    unsafe {
-        std::env::remove_var("CLAUDECODE");
-    }
+    let (text, _, failure) = drain(stream).await;
 
-    assert!(!fake.saw_nested_marker());
+    assert_eq!(failure, None, "one bad byte must not discard the turn");
+    assert_eq!(text, "ok");
 }
 
-// --- structured output ---------------------------------------------------
-
 #[tokio::test]
-async fn an_output_schema_reaches_the_json_schema_flag() {
-    let fake = FakeClaude::printing(&envelope("{}"));
+async fn a_stream_survives_a_child_that_floods_stderr_first() {
+    let flood = "e".repeat(2 * 1024 * 1024);
+    let fake = FakeClaude::builder()
+        .stdout(&frame_stream("ok", ""))
+        .stderr(&flood)
+        .stderr_first()
+        .build();
     let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
 
-    let mut req = request("describe a person");
-    req.output_schema = Some(schemars::schema_for!(Person));
-    model.completion(req).await.unwrap();
+    let stream = model.stream(request("hi")).await.unwrap();
+    let (text, _, failure) = tokio::time::timeout(Duration::from_secs(20), drain(stream))
+        .await
+        .expect("a concurrent drain finishes; a sequential one hangs");
 
-    let sent = fake.value_after("--json-schema").expect("--json-schema");
-    let parsed: serde_json::Value = serde_json::from_str(&sent).unwrap();
+    assert_eq!(failure, None);
+    assert_eq!(text, "ok");
+}
+
+#[tokio::test]
+async fn a_stream_does_not_wait_for_a_grandchild_holding_the_pipes() {
+    // Standard error reaches end-of-file only when every write end closes,
+    // including a grandchild that inherited it. Waiting for that holds the
+    // turn open for the grandchild's whole lifetime.
+    let fake = FakeClaude::builder()
+        .stdout(&frame_stream("ok", ""))
+        .orphan_for(Duration::from_secs(10))
+        .build();
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let started = std::time::Instant::now();
+    let stream = model.stream(request("hi")).await.unwrap();
+    let (text, _, failure) = tokio::time::timeout(Duration::from_secs(5), drain(stream))
+        .await
+        .expect("the stream must not wait for the grandchild");
+
+    assert_eq!(failure, None);
+    assert_eq!(text, "ok");
     assert!(
-        parsed
-            .get("properties")
-            .and_then(|p| p.get("name"))
-            .is_some(),
-        "{parsed}"
+        started.elapsed() < Duration::from_secs(4),
+        "waited {:?} for a grandchild that lives 10s",
+        started.elapsed()
     );
 }
 
-#[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
-struct Person {
-    name: String,
-    age: u8,
+#[tokio::test]
+async fn dropping_a_stream_kills_the_child() {
+    // `StreamingCompletionResponse::cancel` drops the provider stream exactly
+    // this way, so this is a supported operation, not a consumer mistake.
+    let fake = FakeClaude::builder()
+        .stdout(&frame_stream("a", "b"))
+        .delay_mid(Duration::from_millis(200))
+        .sentinel_after(Duration::from_millis(700))
+        .build();
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let mut stream = model.stream(request("hi")).await.unwrap();
+    let _first = stream.next().await;
+    drop(stream);
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !fake.sentinel_exists(),
+        "the child outlived the dropped stream"
+    );
+}
+
+#[tokio::test]
+async fn a_stream_timeout_kills_a_slow_child() {
+    let fake = FakeClaude::builder()
+        .stdout(&frame_stream("a", "b"))
+        .delay_before(Duration::from_secs(30))
+        .build();
+    let model = ClaudeCodeModel::new("haiku")
+        .with_binary(fake.path())
+        .with_timeout(Duration::from_millis(300));
+
+    let stream = model.stream(request("hi")).await.unwrap();
+    let (_, _, failure) = drain(stream).await;
+
+    let failure = failure.expect("the timeout should surface");
+    assert!(failure.contains("did not finish within"), "{failure}");
+}
+
+// --- the agent runtime -----------------------------------------------------
+
+#[tokio::test]
+async fn drives_an_agent_end_to_end() {
+    let fake = FakeClaude::printing(&envelope("a forecast"));
+    let client = ClaudeCodeClient::new(fake.path());
+
+    let agent = client.agent("haiku").preamble("Be terse.").build();
+    let answer = agent.prompt("Report on Dogger.").await.unwrap();
+
+    assert_eq!(answer, "a forecast");
+    assert_eq!(fake.system_prompt().as_deref(), Some("Be terse."));
+    assert_eq!(fake.stdin(), "Report on Dogger.");
+}
+
+#[tokio::test]
+async fn threads_history_through_the_agent() {
+    let fake = FakeClaude::printing(&envelope("second answer"));
+    let client = ClaudeCodeClient::new(fake.path());
+    let agent = client.agent("haiku").build();
+
+    let mut history = vec![
+        Message::user("first question"),
+        Message::assistant("first answer"),
+    ];
+    let answer = agent.chat("second question", &mut history).await.unwrap();
+
+    assert_eq!(answer, "second answer");
+
+    let prompt = fake.stdin();
+    assert!(prompt.contains("user: first question"), "{prompt}");
+    assert!(prompt.contains("assistant: first answer"), "{prompt}");
+    assert!(prompt.ends_with("second question"), "{prompt}");
+}
+
+#[tokio::test]
+async fn an_agent_with_context_documents_sends_them_with_their_ids() {
+    let fake = FakeClaude::printing(&envelope("ok"));
+    let client = ClaudeCodeClient::new(fake.path());
+
+    let agent = client
+        .agent("haiku")
+        .context("a flurbo is a green alien")
+        .build();
+    agent.prompt("what is a flurbo?").await.unwrap();
+
+    let prompt = fake.stdin();
+    assert!(prompt.contains("a flurbo is a green alien"), "{prompt}");
+    assert!(
+        prompt.contains("<file id:"),
+        "a preamble that says to cite sources needs the id: {prompt}"
+    );
+    let context = prompt.find("<context-").expect("a context section");
+    let question = prompt.find("what is a flurbo?").expect("the question");
+    assert!(context < question, "{prompt}");
+}
+
+#[tokio::test]
+async fn an_agent_with_a_tool_fails_with_a_downcastable_error() {
+    let fake = FakeClaude::printing(&envelope("ok"));
+    let client = ClaudeCodeClient::new(fake.path());
+
+    let agent = client.agent("haiku").tool(tools::Add).build();
+    let error = agent.prompt("add 2 and 2").await.unwrap_err();
+
+    let rendered = error.to_string();
+    assert!(rendered.contains("tool definitions"), "{rendered}");
+    assert!(rendered.contains("MCP"), "{rendered}");
+
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&error);
+    let mut refusal = None;
+    while let Some(current) = source {
+        if let Some(found) = current.downcast_ref::<UnsupportedSetting>() {
+            refusal = Some(*found);
+            break;
+        }
+        source = std::error::Error::source(current);
+    }
+    assert_eq!(
+        refusal.map(|r| r.setting),
+        Some("tool definitions"),
+        "a caller falling back to another provider must branch on the cause, \
+         not on the message text"
+    );
+    assert_eq!(fake.spawn_count(), 0);
+}
+
+#[tokio::test]
+async fn an_agent_returns_a_parsed_struct_through_native_output() {
+    #[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema, Debug, PartialEq)]
+    struct Person {
+        name: String,
+        age: u8,
+    }
+
+    let fake = FakeClaude::printing(&envelope(r#"{\"name\":\"Ada\",\"age\":36}"#));
+    let client = ClaudeCodeClient::new(fake.path());
+
+    let agent = client.agent("haiku").build();
+    let person: Person = agent.prompt_typed("who?").await.unwrap();
+
+    assert_eq!(
+        person,
+        Person {
+            name: "Ada".to_owned(),
+            age: 36
+        }
+    );
+    let schema = fake.value_after("--json-schema").expect("--json-schema");
+    assert!(schema.contains("name"), "{schema}");
 }
 
 mod tools {

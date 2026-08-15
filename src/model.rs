@@ -1,15 +1,22 @@
 //! The completion model: the only part of the crate that performs IO.
 
+use std::io::Write as _;
 use std::process::Stdio;
+use std::time::Duration;
 
 use rig_core::completion::{
     CompletionError, CompletionModel, CompletionRequest, CompletionResponse,
 };
 use rig_core::streaming::{RawStreamingChoice, StreamingCompletionResponse};
-use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};
+use std::sync::{Arc, Mutex};
+
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::process::{Child, Command};
+use tokio::task::JoinHandle;
 
 use crate::client::{ClaudeCodeClient, DEFAULT_BINARY};
-use crate::response::{self, CliResult};
+use crate::request::CommandSpec;
+use crate::response::{self, CliResponse};
 use crate::{request, streaming};
 
 /// Environment variable Claude Code sets to mark a nested session.
@@ -18,12 +25,51 @@ use crate::{request, streaming};
 /// launched from inside a Claude Code session treats itself as nested.
 const NESTED_SESSION_ENV: &str = "CLAUDECODE";
 
+/// Flags this crate sets itself, which [`ClaudeCodeModel::with_args`] must not
+/// duplicate.
+///
+/// Passing `--model` through the escape hatch would otherwise silently
+/// override the model the rig request asked for, which is the same class of
+/// quiet misconfiguration the request guards exist to prevent.
+const OWNED_FLAGS: &[&str] = &[
+    "-p",
+    "--print",
+    "--output-format",
+    "--model",
+    "--tools",
+    "--strict-mcp-config",
+    "--setting-sources",
+    "--disable-slash-commands",
+    "--json-schema",
+    "--system-prompt",
+    "--system-prompt-file",
+    "--include-partial-messages",
+    "--verbose",
+];
+
+/// How long to keep reading a pipe after the child has exited.
+///
+/// Long enough that a loaded machine still delivers the last of the output,
+/// short enough that a grandchild holding the pipe open does not hold the turn
+/// open with it. Standard output gets the longer grace because it carries the
+/// answer; standard error only decorates an error message.
+const STDOUT_GRACE: Duration = Duration::from_secs(5);
+
+/// How long to keep reading stderr after the child has exited.
+const STDERR_GRACE: Duration = Duration::from_millis(200);
+
+/// The most stderr kept for an error message.
+const STDERR_LIMIT: usize = 64 * 1024;
+
+/// The most stdout accepted from a blocking turn.
+const STDOUT_LIMIT: usize = 16 * 1024 * 1024;
+
 /// Unwrap a child's pipe handle.
 ///
-/// `spawn` only leaves one of these empty when the corresponding
-/// [`Stdio`] was not configured as a pipe, which the caller three lines
-/// earlier guarantees it was. The guard stays because that guarantee lives in
-/// a different statement from this one, and a future edit to the `Stdio`
+/// `spawn` only leaves one of these empty when the corresponding [`Stdio`] was
+/// not configured as a pipe, which [`ClaudeCodeModel::spawn_child`]
+/// guarantees it was. The guard stays because that guarantee lives in a
+/// different function from this one, and a future edit to the `Stdio`
 /// configuration should produce a named error rather than a panic.
 fn require_pipe<T>(pipe: Option<T>, name: &str) -> Result<T, CompletionError> {
     pipe.ok_or_else(|| {
@@ -31,31 +77,183 @@ fn require_pipe<T>(pipe: Option<T>, name: &str) -> Result<T, CompletionError> {
     })
 }
 
+/// Write `text` to a fresh temporary file readable only by this user.
+///
+/// `NamedTempFile` creates the file 0600, which matters because the system
+/// prompt holds whatever the caller put in a preamble.
+fn write_private_file(text: &str) -> Result<tempfile::NamedTempFile, CompletionError> {
+    let write = || -> std::io::Result<tempfile::NamedTempFile> {
+        let mut file = tempfile::NamedTempFile::new()?;
+        file.write_all(text.as_bytes())?;
+        file.flush()?;
+        Ok(file)
+    };
+    write().map_err(|error| {
+        CompletionError::ProviderError(format!(
+            "cannot create a file for the system prompt: {error}"
+        ))
+    })
+}
+
+/// Report a turn that outlived its deadline.
+fn timed_out(program: &str, timeout: Duration) -> CompletionError {
+    CompletionError::ProviderError(format!(
+        "`{program}` did not finish within {timeout:?}; the child was killed"
+    ))
+}
+
+/// A running drain of one of the child's pipes.
+///
+/// The bytes accumulate in a shared buffer rather than in the task's return
+/// value, so a caller that stops waiting can still read what arrived. That
+/// matters because a pipe reaches end-of-file only when *every* write end
+/// closes, including a grandchild that inherited it — an MCP server, an
+/// uploader, a telemetry flush — and waiting for that would hold the turn
+/// open for the grandchild's whole lifetime.
+struct Drain {
+    task: JoinHandle<()>,
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Drain {
+    /// Start reading `reader`, keeping at most `limit` bytes.
+    ///
+    /// Reading continues past the limit and discards the surplus, so the pipe
+    /// never fills and the child never blocks writing to it. Only the retained
+    /// prefix costs memory.
+    fn start<R>(mut reader: R, limit: usize) -> Self
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&buffer);
+        let task = tokio::spawn(async move {
+            let mut chunk = vec![0; 8192];
+            loop {
+                match reader.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => {
+                        let slice = chunk.get(..read).unwrap_or_default();
+                        let Ok(mut kept) = sink.lock() else { break };
+                        let room = limit.saturating_sub(kept.len());
+                        if room > 0 {
+                            kept.extend_from_slice(slice.get(..room.min(read)).unwrap_or_default());
+                        }
+                    }
+                }
+            }
+        });
+        Self { task, buffer }
+    }
+
+    /// Wait up to `grace` for the pipe to close, then take what there is.
+    ///
+    /// Whatever arrived is returned either way: a pipe still held open by a
+    /// grandchild is not a reason to discard the bytes already read.
+    async fn finish(self, grace: Duration) -> Vec<u8> {
+        let Self { mut task, buffer } = self;
+        let _ = tokio::time::timeout(grace, &mut task).await;
+        // The task is abandoned rather than joined when the grace elapses;
+        // aborting it here would be a race against the bytes still in flight,
+        // and the buffer is already shared.
+        task.abort();
+        buffer.lock().map(|bytes| bytes.clone()).unwrap_or_default()
+    }
+}
+
 /// A rig completion model that runs `claude -p` for each turn.
 ///
 /// Build one through [`ClaudeCodeClient`], or directly with
 /// [`ClaudeCodeModel::new`] when there is no client to hang it off.
+///
+/// # Process lifetime
+///
+/// Every turn is one child process. The child is killed when the future or the
+/// stream driving it is dropped, so an abandoned turn does not leave a `claude`
+/// running and spending the login's usage. Set
+/// [`ClaudeCodeModel::with_timeout`] to bound a turn that never finishes on its
+/// own; without one, a wedged child waits forever.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClaudeCodeModel {
     model: String,
     binary: String,
+    extra_args: Vec<String>,
+    current_dir: Option<String>,
+    timeout: Option<Duration>,
 }
 
 impl ClaudeCodeModel {
     /// A model handle for the given model alias or id, running the `claude`
     /// binary on `PATH`.
+    ///
+    /// `model` is passed to the CLI's `--model`. It takes the aliases in
+    /// [`crate::models`] as well as a full model id.
     #[must_use]
     pub fn new(model: impl Into<String>) -> Self {
         Self {
             model: model.into(),
             binary: DEFAULT_BINARY.to_owned(),
+            extra_args: Vec::new(),
+            current_dir: None,
+            timeout: None,
         }
     }
 
     /// Run a specific binary instead of the one on `PATH`.
+    ///
+    /// The binary runs with this process's full privileges, so its path is
+    /// trusted configuration. See the crate's trust model in the README.
     #[must_use]
     pub fn with_binary(mut self, binary: impl Into<String>) -> Self {
         self.binary = binary.into();
+        self
+    }
+
+    /// Pass additional arguments to the CLI.
+    ///
+    /// This is the escape hatch for CLI capabilities this crate does not model
+    /// — `--add-dir`, `--max-budget-usd`, `--fallback-model`, and so on. The
+    /// arguments are appended after the ones the crate sets.
+    ///
+    /// An argument that collides with a flag the crate owns is rejected when
+    /// the turn runs, rather than silently overriding it.
+    #[must_use]
+    pub fn with_args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.extra_args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    /// Give the CLI an MCP server configuration, which is its route to tools.
+    ///
+    /// Equivalent to [`ClaudeCodeModel::with_args`] with `--mcp-config` and the
+    /// path. The tools stay under the CLI's control: rig never sees them, and
+    /// registering a rig tool on the agent still fails.
+    #[must_use]
+    pub fn with_mcp_config(self, path: impl Into<String>) -> Self {
+        self.with_args(["--mcp-config".to_owned(), path.into()])
+    }
+
+    /// Run the child in a specific working directory.
+    ///
+    /// The child otherwise inherits this process's directory, which decides
+    /// what `--add-dir` and any MCP server resolve relative paths against.
+    #[must_use]
+    pub fn with_current_dir(mut self, dir: impl Into<String>) -> Self {
+        self.current_dir = Some(dir.into());
+        self
+    }
+
+    /// Kill the child and fail the turn if it runs longer than `timeout`.
+    ///
+    /// There is no default. A `claude` that wedges holds the caller forever
+    /// unless a timeout is set here or the caller imposes its own.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
         self
     }
 
@@ -70,11 +268,96 @@ impl ClaudeCodeModel {
     pub fn binary(&self) -> &str {
         &self.binary
     }
+
+    /// The timeout applied to a turn, if any.
+    #[must_use]
+    pub fn timeout(&self) -> Option<Duration> {
+        self.timeout
+    }
+
+    /// Reject extra arguments that would override a flag the crate sets.
+    fn check_extra_args(&self) -> Result<(), CompletionError> {
+        for arg in &self.extra_args {
+            let flag = arg.split('=').next().unwrap_or(arg);
+            if OWNED_FLAGS.contains(&flag) {
+                return Err(CompletionError::RequestError(
+                    format!(
+                        "`{flag}` is set by rig-claude-code; passing it through with_args \
+                         would override the request rather than extend it"
+                    )
+                    .into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Start the child described by `spec`.
+    ///
+    /// Returns the child, the task feeding it the prompt, and the temporary
+    /// file holding the system prompt, which must outlive the child.
+    ///
+    /// The prompt is written on a separate task. Writing it inline before
+    /// reading stdout is a deadlock: a prompt larger than the pipe buffer
+    /// blocks this end, while the child blocks writing to a stdout or stderr
+    /// pipe nobody is draining. That is the same deadlock the concurrent
+    /// stderr drain avoids, entered from the other side, and it would bite
+    /// exactly the large prompts stdin exists to carry.
+    fn spawn_child(
+        &self,
+        spec: &CommandSpec,
+    ) -> Result<(Child, JoinHandle<()>, Option<tempfile::NamedTempFile>), CompletionError> {
+        self.check_extra_args()?;
+
+        // The system prompt goes in a private file rather than argv: the CLI
+        // scans raw argv for `--settings=` ahead of its own option parsing, so
+        // a system prompt beginning with that text executes as a flag.
+        let system_file = spec
+            .system_prompt
+            .as_deref()
+            .map(write_private_file)
+            .transpose()?;
+
+        let mut command = Command::new(&self.binary);
+        command
+            .args(&spec.args)
+            .args(&self.extra_args)
+            .env_remove(NESTED_SESSION_ENV)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        if let Some(file) = &system_file {
+            command
+                .arg("--system-prompt-file")
+                .arg(file.path().as_os_str());
+        }
+        if let Some(dir) = &self.current_dir {
+            command.current_dir(dir);
+        }
+
+        let mut child = command.spawn().map_err(|error| {
+            CompletionError::ProviderError(format!("cannot run `{}`: {error}", self.binary))
+        })?;
+
+        let mut stdin = require_pipe(child.stdin.take(), "stdin")?;
+        let prompt = spec.stdin.clone();
+        let feed = tokio::spawn(async move {
+            // A child that exits before reading the whole prompt closes the
+            // pipe. A write to a closed pipe is not a reason to abandon the
+            // turn: the child's own output says what went wrong, and
+            // reporting the write failure instead would hide it.
+            let _ = stdin.write_all(prompt.as_bytes()).await;
+            let _ = stdin.shutdown().await;
+        });
+
+        Ok((child, feed, system_file))
+    }
 }
 
 impl CompletionModel for ClaudeCodeModel {
-    type Response = CliResult;
-    type StreamingResponse = CliResult;
+    type Response = CliResponse;
+    type StreamingResponse = CliResponse;
     type Client = ClaudeCodeClient;
 
     fn make(client: &Self::Client, model: impl Into<String>) -> Self {
@@ -85,30 +368,56 @@ impl CompletionModel for ClaudeCodeModel {
         &self,
         request: CompletionRequest,
     ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
-        let spec = request::build(&self.binary, &self.model, &request, request::Mode::Blocking)?;
+        let spec = request::build(&self.model, &request, request::Mode::Blocking)?;
+        let (mut child, feed, _system_file) = self.spawn_child(&spec)?;
 
-        let output = tokio::process::Command::new(&spec.program)
-            .args(&spec.args)
-            .env_remove(NESTED_SESSION_ENV)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .map_err(|error| {
-                CompletionError::ProviderError(format!("cannot run `{}`: {error}", spec.program))
-            })?;
+        let stdout = require_pipe(child.stdout.take(), "stdout")?;
+        let stderr = require_pipe(child.stderr.take(), "stderr")?;
+        let stderr_drain = Drain::start(stderr, STDERR_LIMIT);
+        let stdout_drain = Drain::start(stdout, STDOUT_LIMIT);
 
-        if !output.status.success() {
-            return Err(CompletionError::ProviderError(format!(
-                "`{}` exited with {}: {}",
-                spec.program,
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
+        let turn = async {
+            let status = child.wait().await;
+            let stdout_bytes = stdout_drain.finish(STDOUT_GRACE).await;
+            (status, stdout_bytes)
+        };
+
+        let (status, stdout_bytes) = match self.timeout {
+            // Dropping `child` on the timeout path kills it, because the spawn
+            // set `kill_on_drop`.
+            Some(limit) => tokio::time::timeout(limit, turn)
+                .await
+                .map_err(|_| timed_out(&self.binary, limit))?,
+            None => turn.await,
+        };
+        feed.abort();
+
+        let status = status.map_err(|error| {
+            CompletionError::ProviderError(format!("waiting for `{}`: {error}", self.binary))
+        })?;
+
+        // The envelope comes first, whatever the exit status. The CLI reports
+        // a usage limit, a rate limit, or an unrecognized model as a
+        // well-formed envelope on stdout *and* exit 1, with stderr empty or
+        // holding only an internal code. Checking the status first would
+        // discard the only readable explanation.
+        if let Some(envelope) = response::find_envelope(&stdout_bytes) {
+            return envelope.into_completion_response();
         }
 
-        response::parse(&output.stdout)?.into_completion_response()
+        let stderr_text = stderr_drain.finish(STDERR_GRACE).await;
+        if status.success() {
+            Err(CompletionError::ResponseError(format!(
+                "unparseable claude output; received: {}",
+                response::quote(&stdout_bytes)
+            )))
+        } else {
+            Err(CompletionError::ProviderError(format!(
+                "`{}` exited with {status}: {}",
+                self.binary,
+                response::quote(&stderr_text)
+            )))
+        }
     }
 
     /// Stream a turn, translating the CLI's JSON frames into raw streaming
@@ -124,82 +433,83 @@ impl CompletionModel for ClaudeCodeModel {
     /// Returns [`CompletionError::RequestError`] for a request the CLI cannot
     /// express, and [`CompletionError::ProviderError`] when the process cannot
     /// be started. Failures that only become visible mid-stream — a non-zero
-    /// exit, a failed turn, a stream that ends without its terminal frame —
-    /// surface as an error item within the stream.
+    /// exit, a failed turn, a stream that ends without its terminal frame, a
+    /// turn that outruns the timeout — surface as an error item within the
+    /// stream.
     async fn stream(
         &self,
         request: CompletionRequest,
     ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
-        let spec = request::build(
-            &self.binary,
-            &self.model,
-            &request,
-            request::Mode::Streaming,
-        )?;
-
-        let mut child = tokio::process::Command::new(&spec.program)
-            .args(&spec.args)
-            .env_remove(NESTED_SESSION_ENV)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| {
-                CompletionError::ProviderError(format!("cannot run `{}`: {error}", spec.program))
-            })?;
+        let spec = request::build(&self.model, &request, request::Mode::Streaming)?;
+        let (mut child, feed, system_file) = self.spawn_child(&spec)?;
 
         let stdout = require_pipe(child.stdout.take(), "stdout")?;
         let stderr = require_pipe(child.stderr.take(), "stderr")?;
+        let stderr_drain = Drain::start(stderr, STDERR_LIMIT);
 
-        // Drain stderr concurrently. A child that fills the stderr pipe while
-        // this end only reads stdout would block forever.
-        let stderr_drain = tokio::spawn(async move {
-            let mut buffer = String::new();
-            let mut reader = BufReader::new(stderr);
-            let _ = reader.read_to_string(&mut buffer).await;
-            buffer
-        });
-
-        let program = spec.program.clone();
+        let program = self.binary.clone();
+        let timeout = self.timeout;
         let frames = async_stream::stream! {
-            let mut lines = BufReader::new(stdout).lines();
+            // Both are held for the whole stream: the temporary file must
+            // outlive the child that reads it, and the feed task must not be
+            // cancelled before the prompt is written.
+            let _system_file = system_file;
+            let _feed = feed;
+
+            let mut lines = streaming::Lines::new(stdout);
             let mut saw_terminal_frame = false;
+            let deadline = timeout.map(|limit| tokio::time::Instant::now() + limit);
 
             loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => match streaming::classify(&line) {
-                        streaming::Event::Emit(choice) => yield Ok(choice),
-                        streaming::Event::Finish(result) => {
-                            saw_terminal_frame = true;
-                            if let Some(id) = result.session_id.clone() {
-                                yield Ok(RawStreamingChoice::MessageId(id));
-                            }
-                            yield Ok(RawStreamingChoice::FinalResponse(*result));
-                        }
-                        streaming::Event::Fail(error) => {
-                            yield Err(error);
-                            return;
-                        }
-                        streaming::Event::Skip => {}
-                    },
-                    Ok(None) => break,
-                    Err(error) => {
+                let line = match read_next(&mut lines, deadline).await {
+                    Err(Deadline) => {
+                        // Returning drops `child`, which kills it: the spawn
+                        // set `kill_on_drop`.
+                        yield Err(timed_out(&program, timeout.unwrap_or_default()));
+                        return;
+                    }
+                    Ok(Err(error)) => {
                         yield Err(CompletionError::ResponseError(format!(
                             "reading output from `{program}`: {error}"
                         )));
                         return;
                     }
+                    Ok(Ok(None)) => break,
+                    Ok(Ok(Some(line))) => line,
+                };
+
+                match streaming::classify(&line) {
+                    streaming::Event::Emit(choice) => yield Ok(choice),
+                    streaming::Event::Finish(result) => {
+                        saw_terminal_frame = true;
+                        if let Some(id) = result.session_id.clone() {
+                            yield Ok(RawStreamingChoice::MessageId(id));
+                        }
+                        yield Ok(RawStreamingChoice::FinalResponse(*result));
+                        // The terminal frame ends the turn. Reading on to
+                        // end-of-file would wait for every process holding the
+                        // pipe open, including a grandchild the CLI left
+                        // running, and a second terminal frame would tear the
+                        // result: usage from the first, identity from the
+                        // second.
+                        break;
+                    }
+                    streaming::Event::Fail(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                    streaming::Event::Skip => {}
                 }
             }
 
             let status = child.wait().await;
-            let stderr_text = stderr_drain.await.unwrap_or_default();
+            let stderr_text = stderr_drain.finish(STDERR_GRACE).await;
 
             match status {
                 Ok(status) if !status.success() => {
                     yield Err(CompletionError::ProviderError(format!(
                         "`{program}` exited with {status}: {}",
-                        stderr_text.trim()
+                        response::quote(&stderr_text)
                     )));
                 }
                 Ok(_) if !saw_terminal_frame => {
@@ -220,28 +530,29 @@ impl CompletionModel for ClaudeCodeModel {
     }
 }
 
+/// The deadline passed before a line arrived.
+struct Deadline;
+
+/// Read the next line, honoring `deadline` when there is one.
+async fn read_next<R>(
+    lines: &mut streaming::Lines<R>,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<std::io::Result<Option<String>>, Deadline>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    match deadline {
+        Some(at) => tokio::time::timeout_at(at, lines.next_line())
+            .await
+            .map_err(|_| Deadline),
+        None => Ok(lines.next_line().await),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use rig_core::OneOrMany;
-    use rig_core::completion::Message;
-
-    fn request() -> CompletionRequest {
-        CompletionRequest {
-            model: None,
-            preamble: None,
-            chat_history: OneOrMany::one(Message::user("hi")),
-            documents: vec![],
-            tools: vec![],
-            temperature: None,
-            max_tokens: None,
-            tool_choice: None,
-            additional_params: None,
-            output_schema: None,
-            record_telemetry_content: false,
-        }
-    }
 
     #[test]
     fn require_pipe_passes_a_present_handle_through() {
@@ -266,52 +577,80 @@ mod tests {
         assert_eq!(model.model(), "haiku");
     }
 
-    #[tokio::test]
-    async fn reports_a_missing_binary_as_a_provider_error() {
-        let model = ClaudeCodeModel::new("haiku").with_binary("/nonexistent/claude-binary");
-        let error = model.completion(request()).await.unwrap_err().to_string();
-        assert!(error.contains("cannot run"), "{error}");
-        assert!(error.contains("/nonexistent/claude-binary"), "{error}");
+    #[test]
+    fn carries_no_timeout_by_default() {
+        assert_eq!(ClaudeCodeModel::new("haiku").timeout(), None);
     }
 
-    #[tokio::test]
-    async fn rejects_an_unsupported_request_before_spawning() {
-        // The binary does not exist, so reaching a spawn would produce the
-        // "cannot run" error instead. Getting the request-level error proves
-        // the guard runs first.
-        let model = ClaudeCodeModel::new("haiku").with_binary("/nonexistent/claude-binary");
-        let mut req = request();
-        req.temperature = Some(0.1);
-        let error = model.completion(req).await.unwrap_err().to_string();
-        assert!(error.contains("temperature"), "{error}");
+    #[test]
+    fn takes_a_timeout() {
+        let model = ClaudeCodeModel::new("haiku").with_timeout(Duration::from_secs(3));
+        assert_eq!(model.timeout(), Some(Duration::from_secs(3)));
     }
 
-    #[tokio::test]
-    async fn streaming_reports_a_missing_binary_before_returning_a_stream() {
-        let model = ClaudeCodeModel::new("haiku").with_binary("/nonexistent/claude-binary");
-        // `StreamingCompletionResponse` is not `Debug`, so the success side
-        // cannot be unwrapped away; match instead.
-        match model.stream(request()).await {
-            Err(error) => {
-                let rendered = error.to_string();
-                assert!(rendered.contains("cannot run"), "{rendered}");
-                assert!(
-                    rendered.contains("/nonexistent/claude-binary"),
-                    "{rendered}"
-                );
-            }
-            Ok(_) => panic!("a missing binary should fail before a stream exists"),
+    #[test]
+    fn accumulates_extra_arguments_in_order() {
+        let model = ClaudeCodeModel::new("haiku")
+            .with_args(["--add-dir", "/tmp"])
+            .with_mcp_config("/etc/mcp.json");
+        assert_eq!(
+            model.extra_args,
+            vec!["--add-dir", "/tmp", "--mcp-config", "/etc/mcp.json"]
+        );
+        assert!(model.check_extra_args().is_ok());
+    }
+
+    #[test]
+    fn takes_a_working_directory() {
+        let model = ClaudeCodeModel::new("haiku").with_current_dir("/srv");
+        assert_eq!(model.current_dir.as_deref(), Some("/srv"));
+    }
+
+    #[test]
+    fn rejects_extra_arguments_that_override_the_request() {
+        for hostile in [
+            vec!["--model", "opus"],
+            vec!["--output-format", "text"],
+            vec!["--system-prompt-file", "/tmp/other"],
+            vec!["--tools", "Bash"],
+        ] {
+            let model = ClaudeCodeModel::new("haiku").with_args(hostile.clone());
+            let error = model.check_extra_args().unwrap_err().to_string();
+            assert!(
+                error.contains("is set by rig-claude-code"),
+                "{hostile:?} -> {error}"
+            );
         }
     }
 
+    #[test]
+    fn rejects_an_owned_flag_in_its_equals_form() {
+        let model = ClaudeCodeModel::new("haiku").with_args(["--model=opus"]);
+        assert!(model.check_extra_args().is_err());
+    }
+
+    #[test]
+    fn names_the_timeout_in_the_error() {
+        let error = timed_out("claude", Duration::from_millis(250)).to_string();
+        assert!(error.contains("250ms"), "{error}");
+        assert!(error.contains("was killed"), "{error}");
+    }
+
     #[tokio::test]
-    async fn streaming_rejects_an_unsupported_request_before_spawning() {
-        let model = ClaudeCodeModel::new("haiku").with_binary("/nonexistent/claude-binary");
-        let mut req = request();
-        req.max_tokens = Some(10);
-        match model.stream(req).await {
-            Err(error) => assert!(error.to_string().contains("max_tokens"), "{error}"),
-            Ok(_) => panic!("an unsupported request should be refused"),
-        }
+    async fn a_drain_keeps_only_its_budget() {
+        let input = std::io::Cursor::new(vec![b'x'; 5000]);
+        let kept = Drain::start(input, 100)
+            .finish(Duration::from_secs(5))
+            .await;
+        assert_eq!(kept.len(), 100, "the surplus is drained and discarded");
+    }
+
+    #[tokio::test]
+    async fn a_drain_keeps_everything_under_budget() {
+        let input = std::io::Cursor::new(b"short".to_vec());
+        let kept = Drain::start(input, 100)
+            .finish(Duration::from_secs(5))
+            .await;
+        assert_eq!(kept, b"short");
     }
 }

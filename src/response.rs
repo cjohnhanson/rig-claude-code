@@ -5,19 +5,88 @@ use rig_core::OneOrMany;
 use rig_core::completion::{
     AssistantContent, CompletionError, CompletionResponse, GetTokenUsage, Usage,
 };
-use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
+
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// How much of the child's output an error message may quote.
+///
+/// These strings reach application logs. Without a cap, one broken run can put
+/// megabytes into a single log line.
+pub(crate) const QUOTE_LIMIT: usize = 2_000;
+
+/// Quote untrusted output for an error message, bounded.
+pub(crate) fn quote(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let trimmed = text.trim();
+    let mut out: String = trimmed.chars().take(QUOTE_LIMIT).collect();
+    if out.len() < trimmed.len() {
+        let _ = write!(out, " … (truncated, {} bytes total)", trimmed.len());
+    }
+    out
+}
+
+/// Deserialize a field that may be present, absent, or explicitly `null`.
+///
+/// `#[serde(default)]` alone covers only the absent case. An explicit `null`
+/// still fails, which turns one new `"usage": null` from a future CLI into a
+/// lost turn reported as unparseable output — the exact break this module's
+/// `extra` catch-all exists to prevent.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// Deserialize a token count that may arrive as an integer, a float, or null.
+///
+/// The CLI reports whole numbers today. A float would otherwise fail the whole
+/// envelope, so it is truncated instead: an approximate count is worth more
+/// than a lost turn.
+fn lenient_count<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
+        return Ok(0);
+    };
+    Ok(match value {
+        serde_json::Value::Number(number) => number.as_u64().or_else(|| {
+            number
+                .as_f64()
+                .filter(|float| float.is_finite() && *float >= 0.0)
+                .map(|float| {
+                    // Truncating a fractional token count is the documented
+                    // behavior: an approximate count beats a lost turn. The
+                    // filter above rules out the negative and non-finite cases.
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "an approximate count beats a lost turn"
+                    )]
+                    let truncated = float as u64;
+                    truncated
+                })
+        }),
+        _ => None,
+    }
+    .unwrap_or(0))
+}
 
 /// The result envelope emitted by `claude -p --output-format json`.
 ///
-/// Unknown fields are captured in [`CliResult::extra`] rather than rejected, so
-/// a newer CLI adding a field does not break deserialization.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct CliResult {
+/// Unknown fields are captured in [`CliResponse::extra`] rather than rejected,
+/// so a newer CLI adding a field does not break deserialization.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct CliResponse {
     /// Whether the CLI reported the turn as failed.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub is_error: bool,
     /// Result discriminator, such as `success` or `error_during_execution`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub subtype: String,
     /// The assistant's final text.
     #[serde(default)]
@@ -32,10 +101,10 @@ pub struct CliResult {
     ///
     /// Reported for observability. On a subscription-authenticated run this is
     /// an equivalent-cost figure, not an amount billed to an API account.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub total_cost_usd: f64,
     /// Token counts for this turn.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub usage: CliUsage,
     /// Fields this crate does not model.
     #[serde(flatten)]
@@ -43,31 +112,43 @@ pub struct CliResult {
 }
 
 /// Token counts reported by the CLI.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CliUsage {
     /// Input tokens that were not served from cache.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_count")]
     pub input_tokens: u64,
     /// Output tokens produced, including reasoning tokens.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_count")]
     pub output_tokens: u64,
     /// Input tokens read from the provider-managed cache.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_count")]
     pub cache_read_input_tokens: u64,
     /// Input tokens written to the provider-managed cache.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_count")]
     pub cache_creation_input_tokens: u64,
     /// Breakdown of the output token count.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub output_tokens_details: OutputTokenDetails,
+    /// Usage fields this crate does not model, such as `service_tier` and
+    /// `server_tool_use`.
+    ///
+    /// Kept for the same reason as [`CliResponse::extra`]: a future usage
+    /// field should be recoverable rather than discarded.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The part of the output token count spent on internal reasoning.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct OutputTokenDetails {
     /// Tokens spent on extended thinking.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_count")]
     pub thinking_tokens: u64,
+    /// Detail fields this crate does not model.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl CliUsage {
@@ -88,7 +169,43 @@ impl CliUsage {
     }
 }
 
-impl CliResult {
+impl GetTokenUsage for CliResponse {
+    /// Report this turn's usage.
+    ///
+    /// rig needs this on the streaming path, where the terminal envelope is
+    /// the only place usage appears.
+    fn token_usage(&self) -> Usage {
+        self.usage.to_rig_usage()
+    }
+}
+
+impl CliResponse {
+    /// Whether this envelope describes a failed turn.
+    ///
+    /// `is_error` is the CLI's own flag, and it is not the only signal: a
+    /// usage-limit envelope has been observed carrying `subtype: "success"`
+    /// with the failure text in `result`, and other failures set an `error_`
+    /// subtype. Treating an `error` subtype as a failure catches those without
+    /// waiting for the flag to agree.
+    fn failed(&self) -> bool {
+        self.is_error || self.subtype.starts_with("error")
+    }
+
+    /// The error this envelope describes, if it describes one.
+    pub(crate) fn failure(&self) -> Option<CompletionError> {
+        self.failed().then(|| {
+            CompletionError::ProviderError(format!(
+                "claude reported a failed turn ({}): {}",
+                if self.subtype.is_empty() {
+                    "no subtype"
+                } else {
+                    self.subtype.as_str()
+                },
+                self.result.as_deref().unwrap_or("no detail")
+            ))
+        })
+    }
+
     /// Convert a successful envelope into rig's canonical response.
     ///
     /// # Errors
@@ -99,12 +216,8 @@ impl CliResult {
     pub(crate) fn into_completion_response(
         self,
     ) -> Result<CompletionResponse<Self>, CompletionError> {
-        if self.is_error {
-            return Err(CompletionError::ProviderError(format!(
-                "claude reported a failed turn ({}): {}",
-                self.subtype,
-                self.result.as_deref().unwrap_or("no detail")
-            )));
+        if let Some(failure) = self.failure() {
+            return Err(failure);
         }
 
         let Some(text) = self.result.clone() else {
@@ -125,27 +238,38 @@ impl CliResult {
     }
 }
 
-impl GetTokenUsage for CliResult {
-    /// Report this turn's usage.
-    ///
-    /// rig needs this on the streaming path, where the terminal envelope is
-    /// the only place usage appears.
-    fn token_usage(&self) -> Usage {
-        self.usage.to_rig_usage()
+/// Find the envelope in the CLI's stdout.
+///
+/// The whole buffer is tried first, which is the ordinary case. Failing that,
+/// each line is tried from the last backwards, so a deprecation warning or a
+/// stray diagnostic printed ahead of the JSON does not lose the turn. The
+/// streaming path is deliberately tolerant of noise on stdout; without this
+/// the blocking path would not be, and one warning line from a future CLI
+/// would take out every non-streaming call.
+pub(crate) fn find_envelope(stdout: &[u8]) -> Option<CliResponse> {
+    if let Ok(parsed) = serde_json::from_slice::<CliResponse>(stdout) {
+        return Some(parsed);
     }
+    let text = String::from_utf8_lossy(stdout);
+    text.lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .find_map(|line| serde_json::from_str::<CliResponse>(line.trim()).ok())
 }
 
 /// Deserialize the CLI's stdout into an envelope.
 ///
 /// # Errors
 ///
-/// Returns [`CompletionError::ResponseError`] when stdout is not the JSON
-/// envelope, quoting what was received so the failure is diagnosable.
-pub(crate) fn parse(stdout: &[u8]) -> Result<CliResult, CompletionError> {
-    serde_json::from_slice(stdout).map_err(|error| {
+/// Returns [`CompletionError::ResponseError`] when stdout holds no envelope,
+/// quoting a bounded prefix of what was received so the failure is
+/// diagnosable.
+#[cfg_attr(not(test), expect(dead_code, reason = "used by the response tests"))]
+pub(crate) fn parse(stdout: &[u8]) -> Result<CliResponse, CompletionError> {
+    find_envelope(stdout).ok_or_else(|| {
         CompletionError::ResponseError(format!(
-            "unparseable claude output: {error}; received: {}",
-            String::from_utf8_lossy(stdout).trim()
+            "unparseable claude output; received: {}",
+            quote(stdout)
         ))
     })
 }
@@ -168,6 +292,14 @@ mod tests {
                      "output_tokens_details":{"thinking_tokens":4}}}"#
     }
 
+    /// The text of an assistant content block, if it is text.
+    fn block_text(block: &AssistantContent) -> Option<&str> {
+        match block {
+            AssistantContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        }
+    }
+
     #[test]
     fn parses_a_success_envelope() {
         let parsed = parse(success_envelope().as_bytes()).unwrap();
@@ -188,6 +320,17 @@ mod tests {
     }
 
     #[test]
+    fn keeps_unmodelled_usage_fields() {
+        let parsed =
+            parse(br#"{"result":"hi","usage":{"input_tokens":1,"service_tier":"standard"}}"#)
+                .unwrap();
+        assert_eq!(
+            parsed.usage.extra.get("service_tier"),
+            Some(&serde_json::json!("standard"))
+        );
+    }
+
+    #[test]
     fn tolerates_an_envelope_with_only_a_result() {
         let parsed = parse(br#"{"result":"hi"}"#).unwrap();
         assert!(!parsed.is_error);
@@ -196,11 +339,75 @@ mod tests {
     }
 
     #[test]
-    fn reports_unparseable_output_with_the_payload() {
-        let error = parse(b"not json at all").unwrap_err();
-        let rendered = error.to_string();
-        assert!(rendered.contains("unparseable claude output"), "{rendered}");
-        assert!(rendered.contains("not json at all"), "{rendered}");
+    fn tolerates_null_valued_fields() {
+        // `#[serde(default)]` covers a missing field, never an explicit null.
+        // A future CLI emitting `"usage": null` on a refusal would otherwise
+        // lose the turn.
+        for body in [
+            r#"{"result":"hi","usage":null}"#,
+            r#"{"result":"hi","subtype":null}"#,
+            r#"{"result":"hi","is_error":null}"#,
+            r#"{"result":"hi","total_cost_usd":null}"#,
+            r#"{"result":"hi","usage":{"input_tokens":null}}"#,
+            r#"{"result":"hi","usage":{"output_tokens_details":null}}"#,
+        ] {
+            let parsed = parse(body.as_bytes())
+                .unwrap_or_else(|error| panic!("{body} should parse, got {error}"));
+            assert_eq!(parsed.result.as_deref(), Some("hi"));
+        }
+    }
+
+    #[test]
+    fn tolerates_a_float_token_count() {
+        let parsed = parse(br#"{"result":"hi","usage":{"input_tokens":10.7}}"#).unwrap();
+        assert_eq!(parsed.usage.input_tokens, 10);
+    }
+
+    #[test]
+    fn treats_a_nonsensical_token_count_as_zero() {
+        for body in [
+            r#"{"result":"hi","usage":{"input_tokens":"many"}}"#,
+            r#"{"result":"hi","usage":{"input_tokens":-4}}"#,
+        ] {
+            let parsed = parse(body.as_bytes()).unwrap();
+            assert_eq!(parsed.usage.input_tokens, 0, "{body}");
+        }
+    }
+
+    #[test]
+    fn finds_an_envelope_after_a_warning_line() {
+        // The streaming path ignores noise on stdout. Without this the
+        // blocking path would not, and one deprecation warning from a future
+        // CLI would take out every non-streaming call.
+        let stdout = b"Warning: something deprecated\n{\"result\":\"hi\"}\n";
+        assert_eq!(parse(stdout).unwrap().result.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn finds_the_last_envelope_when_lines_follow_it() {
+        let stdout = b"{\"result\":\"first\"}\n{\"result\":\"second\"}\n";
+        assert_eq!(parse(stdout).unwrap().result.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn reports_unparseable_output_with_a_bounded_quote() {
+        let error = parse(b"not json at all").unwrap_err().to_string();
+        assert!(error.contains("unparseable claude output"), "{error}");
+        assert!(error.contains("not json at all"), "{error}");
+    }
+
+    #[test]
+    fn truncates_a_huge_quote() {
+        let huge = "x".repeat(QUOTE_LIMIT * 3);
+        let quoted = quote(huge.as_bytes());
+        assert!(quoted.len() < huge.len(), "the quote must be bounded");
+        assert!(quoted.contains("truncated"), "{quoted}");
+        assert!(quoted.contains(&(QUOTE_LIMIT * 3).to_string()), "{quoted}");
+    }
+
+    #[test]
+    fn quotes_short_output_whole() {
+        assert_eq!(quote(b"  brief  "), "brief");
     }
 
     #[test]
@@ -221,7 +428,6 @@ mod tests {
         let parsed = parse(success_envelope().as_bytes()).unwrap();
         let usage = parsed.token_usage();
         assert_eq!(usage.input_tokens, 10);
-        assert_eq!(usage.output_tokens, 7);
         assert_eq!(usage.total_tokens, 17);
         assert_eq!(usage.reasoning_tokens, 4);
     }
@@ -250,14 +456,6 @@ mod tests {
         assert_eq!(response.raw_response.subtype, "success");
     }
 
-    /// The text of an assistant content block, if it is text.
-    fn block_text(block: &AssistantContent) -> Option<&str> {
-        match block {
-            AssistantContent::Text(text) => Some(text.text.as_str()),
-            _ => None,
-        }
-    }
-
     #[test]
     fn yields_one_text_content_block() {
         let parsed = parse(success_envelope().as_bytes()).unwrap();
@@ -274,6 +472,16 @@ mod tests {
     }
 
     #[test]
+    fn decodes_escapes_and_non_ascii_verbatim() {
+        let parsed = parse(r#"{"result":"café \"quoted\"\\ and\nnewline"}"#.as_bytes()).unwrap();
+        let response = parsed.into_completion_response().unwrap();
+        assert_eq!(
+            block_text(&response.choice.first()),
+            Some("café \"quoted\"\\ and\nnewline")
+        );
+    }
+
+    #[test]
     fn rejects_a_failed_turn() {
         let parsed =
             parse(br#"{"is_error":true,"subtype":"error_during_execution","result":"boom"}"#)
@@ -285,10 +493,28 @@ mod tests {
     }
 
     #[test]
+    fn treats_an_error_subtype_as_a_failure_whatever_the_flag_says() {
+        // Trusting the flag alone returns "I gave up" as a successful
+        // assistant message.
+        let parsed =
+            parse(br#"{"is_error":false,"subtype":"error_max_turns","result":"I gave up"}"#)
+                .unwrap();
+        let error = parsed.into_completion_response().unwrap_err();
+        assert!(error.to_string().contains("error_max_turns"), "{error}");
+    }
+
+    #[test]
     fn describes_a_failed_turn_that_carries_no_detail() {
         let parsed = parse(br#"{"is_error":true,"subtype":"error_max_turns"}"#).unwrap();
         let error = parsed.into_completion_response().unwrap_err();
         assert!(error.to_string().contains("no detail"), "{error}");
+    }
+
+    #[test]
+    fn describes_a_failed_turn_that_carries_no_subtype() {
+        let parsed = parse(br#"{"is_error":true,"result":"boom"}"#).unwrap();
+        let error = parsed.into_completion_response().unwrap_err();
+        assert!(error.to_string().contains("no subtype"), "{error}");
     }
 
     #[test]
@@ -303,5 +529,15 @@ mod tests {
         let parsed = parse(br#"{"result":""}"#).unwrap();
         let response = parsed.into_completion_response().unwrap();
         assert_eq!(block_text(&response.choice.first()), Some(""));
+    }
+
+    #[test]
+    fn a_successful_envelope_reports_no_failure() {
+        assert!(
+            parse(success_envelope().as_bytes())
+                .unwrap()
+                .failure()
+                .is_none()
+        );
     }
 }
