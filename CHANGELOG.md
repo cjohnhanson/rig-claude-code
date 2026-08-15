@@ -24,9 +24,18 @@ change from a previous version.
   `additional_params`, and any `tool_choice` other than `None`. Each is
   rejected rather than silently dropped.
 - `models`: the `HAIKU`, `SONNET`, `OPUS`, and `FABLE` aliases.
-- `ClaudeCodeModel::with_timeout`, `with_args`, `with_mcp_config`,
-  `with_current_dir`, and `with_binary`. Extra arguments that collide with a
-  flag the crate sets are refused rather than silently overriding it.
+- `with_timeout`, `with_args`, `with_mcp_config`, and `with_current_dir` on
+  both `ClaudeCodeClient` and `ClaudeCodeModel`. Settings on the client are
+  inherited by every model and agent it builds. Extra arguments that collide
+  with a flag the crate sets are refused rather than silently overriding it.
+- `Client` and `CompletionModel`, the names the rig ecosystem uses for a
+  provider's types, as aliases.
+- A failed turn — usage limit, rate limit, unrecognized model — is returned
+  as `CompletionError::ProviderResponse` carrying the CLI's whole envelope,
+  so a caller can branch on its `subtype`.
+- Refusal, up front, of a request whose last message renders to no text and
+  of an output schema over 96 KiB — the one caller-sized value still passed
+  as a command-line argument.
 
 ### Security
 
@@ -43,6 +52,15 @@ change from a previous version.
   usage.
 - Error messages quote a bounded prefix of the child's output, and both pipes
   are read with a byte cap, so a broken child cannot exhaust memory or fill a
-  log line.
+  log line. Output past the cap is reported as a size limit, not a parse
+  failure.
+- Every marker in the flattened transcript — the section tags, the role
+  labels, each document's wrapper — carries a per-request nonce keyed by a
+  per-process salt, so message content can neither close a section early nor
+  forge a turn.
+- Every Claude Code session marker (`CLAUDECODE`, `CLAUDE_*`, `AI_AGENT`) is
+  stripped from the child's environment. A live session exports a messaging
+  token and `CLAUDE_EFFORT` among others; the latter would silently change
+  the effort and cost of every turn.
 
 [Unreleased]: https://github.com/cjohnhanson/rig-claude-code
