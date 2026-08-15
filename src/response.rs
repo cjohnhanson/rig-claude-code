@@ -183,11 +183,12 @@ impl GetTokenUsage for CliResponse {
 impl CliResponse {
     /// Whether this envelope describes a failed turn.
     ///
-    /// `is_error` is the CLI's own flag, and it is not the only signal: a
-    /// usage-limit envelope has been observed carrying `subtype: "success"`
-    /// with the failure text in `result`, and other failures set an `error_`
-    /// subtype. Treating an `error` subtype as a failure catches those without
-    /// waiting for the flag to agree.
+    /// Either signal is enough. `is_error` is the CLI's own flag; the
+    /// `subtype` is its classifier, and the failure subtypes all begin with
+    /// `error`. Requiring both would miss an envelope where the two disagree —
+    /// `is_error: true` with `subtype: "success"` is a shape the CLI's own
+    /// tooling produces for a usage limit — and an envelope where the flag is
+    /// simply absent, which `#[serde(default)]` reads as `false`.
     fn failed(&self) -> bool {
         self.is_error || self.subtype.starts_with("error")
     }
@@ -228,8 +229,8 @@ impl CliResponse {
     ///
     /// # Errors
     ///
-    /// Returns [`CompletionError::ProviderError`] when the envelope reports a
-    /// failed turn, and [`CompletionError::ResponseError`] when a successful
+    /// Returns [`CompletionError::ProviderResponse`] when the envelope reports
+    /// a failed turn, and [`CompletionError::ResponseError`] when a successful
     /// turn carries no result text.
     pub(crate) fn into_completion_response(
         self,

@@ -196,6 +196,52 @@ async fn no_session_marker_reaches_the_child() {
 }
 
 #[tokio::test]
+async fn variables_that_select_the_credential_reach_the_child() {
+    // `CLAUDE_CONFIG_DIR` names the `.claude` directory the CLI reads, and so
+    // which account pays. Stripping it by a `CLAUDE_` prefix would silently
+    // switch accounts — the opposite of "the credential is whatever Claude
+    // Code is already logged in with".
+    let _guard = ENV_LOCK.lock().await;
+    let fake = FakeClaude::printing(envelope());
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    for keep in [
+        "CLAUDE_CONFIG_DIR",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "ANTHROPIC_API_KEY",
+    ] {
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var(keep, "set-by-the-test");
+        }
+    }
+    let result = model.completion(request()).await;
+    for keep in [
+        "CLAUDE_CONFIG_DIR",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "ANTHROPIC_API_KEY",
+    ] {
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var(keep);
+        }
+    }
+    result.unwrap();
+
+    let env = fake.child_env();
+    for keep in [
+        "CLAUDE_CONFIG_DIR",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "ANTHROPIC_API_KEY",
+    ] {
+        assert!(
+            env.iter().any(|name| name == keep),
+            "{keep} must reach the child; it selects the credential"
+        );
+    }
+}
+
+#[tokio::test]
 async fn removes_the_nested_session_marker_from_a_turn() {
     let _guard = ENV_LOCK.lock().await;
     let fake = FakeClaude::printing(envelope());

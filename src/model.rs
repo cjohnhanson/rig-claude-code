@@ -20,27 +20,39 @@ use crate::request::CommandSpec;
 use crate::response::{self, CliResponse};
 use crate::{request, streaming};
 
-/// Environment variables a live Claude Code session exports, all of which are
-/// removed from the child's environment.
+/// Environment variables a live Claude Code session exports to mark itself,
+/// all of which are removed from the child's environment.
 ///
 /// `CLAUDECODE` alone is not enough. A session also exports a messaging socket
 /// and token, a session id, an entrypoint, and `CLAUDE_EFFORT` — which would
 /// silently change the effort level of every turn depending on who launched
 /// the host process, and with it both the cost and the reproducibility of the
-/// invocation. Prefixes are matched, so a marker added by a later version is
-/// stripped too.
-const SESSION_ENV_PREFIXES: &[&str] = &["CLAUDECODE", "CLAUDE_", "AI_AGENT"];
+/// invocation.
+///
+/// These are matched by exact name, not by prefix. A `CLAUDE_` prefix would
+/// also strip `CLAUDE_CONFIG_DIR`, which names the `.claude` directory the CLI
+/// reads and so selects *which account's credential* pays for the turn — the
+/// standard way to keep several logins on one machine — and
+/// `CLAUDE_CODE_USE_BEDROCK` / `CLAUDE_CODE_USE_VERTEX`, which route the turn to
+/// a different backend. Those are the caller's to control, exactly as
+/// `ANTHROPIC_API_KEY` is; removing them would silently switch accounts.
+const SESSION_MARKERS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_PID",
+    "CLAUDE_EFFORT",
+    "AI_AGENT",
+];
 
 /// Remove every inherited Claude Code session marker from `command`.
 fn strip_session_markers(command: &mut Command) {
-    for (name, _) in std::env::vars_os() {
-        let Some(name) = name.to_str() else { continue };
-        if SESSION_ENV_PREFIXES
-            .iter()
-            .any(|prefix| name.starts_with(prefix))
-        {
-            command.env_remove(name);
-        }
+    for marker in SESSION_MARKERS {
+        command.env_remove(marker);
     }
 }
 
@@ -460,7 +472,7 @@ impl CompletionModel for ClaudeCodeModel {
             // grandchild is holding the pipe open, which is the whole reason
             // the grace exists.
             if let Some(envelope) = response::find_envelope(&stdout_drain.snapshot()) {
-                return envelope.into_completion_response();
+                return settle(&binary, envelope, status);
             }
             let truncated = stdout_drain.truncated();
             let stdout_bytes = stdout_drain.finish(STDOUT_GRACE).await;
@@ -471,7 +483,7 @@ impl CompletionModel for ClaudeCodeModel {
             // or holding only an internal code. Checking the status first
             // would discard the only readable explanation.
             if let Some(envelope) = response::find_envelope(&stdout_bytes) {
-                return envelope.into_completion_response();
+                return settle(&binary, envelope, status);
             }
 
             let stderr_text = stderr_drain.finish(STDERR_GRACE).await;
@@ -581,9 +593,18 @@ impl CompletionModel for ClaudeCodeModel {
 
                 let line = match read {
                     Err(Deadline) if exit.is_some() => {
-                        // The child is gone and its output has stopped
-                        // arriving; whatever still holds the pipe open is not
-                        // going to add to this turn.
+                        // The child is gone. If the *turn's* deadline is what
+                        // fired, say so; a timeout reported as "no terminal
+                        // frame" sends the reader after the wrong problem.
+                        // Otherwise the post-exit grace has run out, and
+                        // whatever still holds the pipe open is not going to
+                        // add to this turn.
+                        let turn_expired = deadline
+                            .is_some_and(|at| tokio::time::Instant::now() >= at);
+                        if turn_expired {
+                            yield Err(timed_out(&program, timeout.unwrap_or_default()));
+                            return;
+                        }
                         break;
                     }
                     Err(Deadline) => {
@@ -662,6 +683,29 @@ impl CompletionModel for ClaudeCodeModel {
     }
 }
 
+/// Reconcile a parsed envelope with the child's exit status.
+///
+/// A failed envelope explains itself and wins regardless of status. A
+/// successful envelope beside a non-zero exit is not a success: the CLI wrote
+/// something envelope-shaped and then failed, and the streaming path already
+/// reports that as an error, so the blocking path must agree rather than
+/// return the answer as if the turn were clean.
+fn settle(
+    binary: &str,
+    envelope: CliResponse,
+    status: std::process::ExitStatus,
+) -> Result<CompletionResponse<CliResponse>, CompletionError> {
+    if let Some(failure) = envelope.failure() {
+        return Err(failure);
+    }
+    if !status.success() {
+        return Err(CompletionError::ProviderError(format!(
+            "`{binary}` produced a successful envelope but exited with {status}"
+        )));
+    }
+    envelope.into_completion_response()
+}
+
 /// What a finished stream amounts to, once the child's status is known.
 ///
 /// `None` is a clean turn. Everything else is the error item the stream ends
@@ -714,6 +758,36 @@ mod tests {
     fn exit_with(code: i32) -> std::process::ExitStatus {
         use std::os::unix::process::ExitStatusExt as _;
         std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    #[test]
+    fn a_good_envelope_with_a_failed_exit_is_not_a_success() {
+        let envelope = crate::response::CliResponse {
+            result: Some("the answer".to_owned()),
+            ..Default::default()
+        };
+        let error = settle("claude", envelope, exit_with(3)).unwrap_err();
+        assert!(error.to_string().contains("exited with"), "{error}");
+    }
+
+    #[test]
+    fn a_failed_envelope_explains_itself_whatever_the_exit() {
+        let envelope = crate::response::CliResponse {
+            is_error: true,
+            subtype: "error_max_turns".to_owned(),
+            ..Default::default()
+        };
+        let error = settle("claude", envelope, exit_with(0)).unwrap_err();
+        assert!(error.to_string().contains("error_max_turns"), "{error}");
+    }
+
+    #[test]
+    fn a_good_envelope_with_a_clean_exit_is_the_answer() {
+        let envelope = crate::response::CliResponse {
+            result: Some("the answer".to_owned()),
+            ..Default::default()
+        };
+        assert!(settle("claude", envelope, exit_with(0)).is_ok());
     }
 
     #[test]

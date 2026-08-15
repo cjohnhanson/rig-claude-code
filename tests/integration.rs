@@ -476,6 +476,26 @@ async fn a_failed_turn_is_reported_from_its_envelope_not_its_exit_status() {
 }
 
 #[tokio::test]
+async fn a_good_envelope_beside_a_failed_exit_is_reported_not_returned() {
+    // The streaming path already reports this shape as an error. A CLI that
+    // prints something envelope-shaped and then crashes must not read as a
+    // clean turn on one path and a failed one on the other.
+    let fake = FakeClaude::builder()
+        .stdout(&envelope("the answer"))
+        .exit_code(3)
+        .build();
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let error = model
+        .completion(request("hi"))
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("exited with"), "{error}");
+}
+
+#[tokio::test]
 async fn a_non_zero_exit_with_no_envelope_reports_its_stderr() {
     let fake = FakeClaude::failing("something went wrong", 3);
     let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
