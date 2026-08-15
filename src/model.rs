@@ -153,12 +153,12 @@ impl CompletionModel for ClaudeCodeModel {
 
         // Drain stderr concurrently. A child that fills the stderr pipe while
         // this end only reads stdout would block forever.
-        let stderr_drain = async move {
+        let stderr_drain = tokio::spawn(async move {
             let mut buffer = String::new();
             let mut reader = BufReader::new(stderr);
             let _ = reader.read_to_string(&mut buffer).await;
-            Ok::<String, ()>(buffer)
-        };
+            buffer
+        });
 
         let program = spec.program.clone();
         let frames = async_stream::stream! {
