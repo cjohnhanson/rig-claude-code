@@ -349,9 +349,9 @@ impl FakeClaudeBuilder {
         // A pause inside stdout is expressed by splitting the fixture on the
         // marker and sleeping between the halves.
         let emit_stdout = match self.delay_mid {
-            Some(seconds) => format!(
-                "cat \"$here/stdout\"\nsleep {seconds}\ncat \"$here/stdout2\"\n"
-            ),
+            Some(seconds) => {
+                format!("cat \"$here/stdout\"\nsleep {seconds}\ncat \"$here/stdout2\"\n")
+            }
             None => "cat \"$here/stdout\"\n".to_owned(),
         };
 
