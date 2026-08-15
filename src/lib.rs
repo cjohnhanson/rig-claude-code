@@ -39,21 +39,27 @@
 //! conversation memory and agent hooks, work unchanged. Those are rig's hooks;
 //! the crate does not load the CLI's own hooks.
 //!
+//! # Tools
+//!
+//! Register rig tools on the agent as with any provider; rig runs them and
+//! the CLI is only the model. For each turn that carries tools the crate
+//! serves them to the CLI over a per-turn loopback MCP server, records the
+//! calls the CLI makes, and returns them as `AssistantContent::ToolCall` for
+//! rig's runner to execute. Set `default_max_turns` to at least two.
+//!
 //! # What the transport does not do
 //!
 //! The CLI takes a prompt, a system prompt, a model, and an output schema. It
-//! takes no tool definitions and no sampling parameters. The crate refuses
-//! each unsupported request setting with an error, and never drops one
-//! silently. The error's source is an [`UnsupportedSetting`], so a caller can
-//! branch on the cause and fall back to another provider.
+//! takes no sampling parameters. The crate refuses each unsupported request
+//! setting with an error, and never drops one silently. The error's source
+//! is an [`UnsupportedSetting`], so a caller can branch on the cause and fall
+//! back to another provider.
 //!
-//! - Tools. The CLI's route to tools is MCP; see
-//!   [`ClaudeCodeClient::with_mcp_config`]. This also rules out
-//!   `OutputMode::Tool` and rig's extractor, which use a synthetic output
-//!   tool.
 //! - `temperature` and `max_tokens`. The CLI has no such flags.
 //! - `additional_params`. The CLI has no request body to extend.
-//! - A `tool_choice` other than `None`. No tools are advertised.
+//! - A `tool_choice` of `Required` or `Specific`. The CLI's harness decides
+//!   whether the model calls a tool. This also rules out `OutputMode::Tool`
+//!   and rig's extractor, which force a call to a synthetic output tool.
 //! - A last message with no text. The CLI needs a prompt.
 //! - An output schema over 96 KiB. The schema is passed as one argument, and
 //!   Linux caps an argument at 128 KiB.

@@ -31,11 +31,16 @@ The public surface, in full:
   rejects the schema outright, so without that every `prompt_typed` turn
   failed. A streamed turn yields the model's pre-enforcement prose; the
   enforced JSON is in the terminal frame.
+- rig tools, executed by rig. For each turn that carries tools the crate
+  serves them to the CLI over a per-turn loopback MCP server, records the
+  calls the CLI makes, and returns them as `AssistantContent::ToolCall` for
+  rig's runner to execute. Tool calls and results render in full into the
+  next turn's prompt.
 - `UnsupportedSetting`: a public, downcastable cause for every request setting
-  the transport cannot express: tool definitions, `temperature`, `max_tokens`,
-  `additional_params`, any `tool_choice` other than `None`, a last message with
-  no text, and an output schema over 96 KiB. Each is refused rather than
-  dropped.
+  the transport cannot express: `temperature`, `max_tokens`,
+  `additional_params`, a `tool_choice` of `Required` or `Specific`, a last
+  message with no text, and an output schema over 96 KiB. Each is refused
+  rather than dropped.
 - `models`: the `HAIKU`, `SONNET`, `OPUS`, and `FABLE` aliases.
 - `with_timeout`, `with_args`, `with_mcp_config`, and `with_current_dir` on
   both `ClaudeCodeClient` and `ClaudeCodeModel`. Settings on the client are

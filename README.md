@@ -30,8 +30,9 @@ Use this crate when you want rig's agent, RAG, and memory features, and you
 want each turn billed to a Claude subscription. It suits a small number of
 sequential turns on a machine that has an interactive Claude Code login.
 
-Use rig's own Anthropic provider instead when you need tool-calling agents,
-sampling parameters, high concurrency, or a server with no logged-in CLI.
+Use rig's own Anthropic provider instead when you need sampling parameters,
+high concurrency, streamed structured output, or a server with no logged-in
+CLI.
 
 Anthropic's help centre states that `claude -p` usage draws on a
 subscription's usage limits ([Use Claude Code with your Pro or Max
@@ -164,7 +165,9 @@ This example needs the `futures` crate. `examples/shipping_forecast.rs` runs
 Structured output works through `prompt` and `prompt_typed`, which return
 the whole answer at once. It does not work through `stream_prompt`; see the
 end of this section. Set no output mode: the default `OutputMode::Auto`
-resolves to native structured output because the transport carries no tools.
+resolves to native structured output when the agent has no tools. An agent
+with tools uses `OutputMode::Tool`, which the crate does not support (see the
+reference table).
 
 ```rust,no_run
 use rig::completion::TypedPrompt;
@@ -196,26 +199,84 @@ answer as text. The enforced JSON arrives only in the terminal frame.
 
 ## Give the model tools
 
-The transport accepts no rig tool definitions. The CLI's route to tools is
-MCP. Pass a server configuration, and name each tool the CLI may call:
+Register rig tools on the agent as you would with any provider. rig runs
+them; the CLI is only the model.
 
 ```rust,no_run
+use rig::completion::Prompt;
 use rig::prelude::*;
+use rig::tool::{Tool, ToolContext};
 use rig_claude_code::{ClaudeCodeClient, models};
+use serde::Deserialize;
 
-# fn main() -> Result<(), Box<dyn std::error::Error>> {
-let client = ClaudeCodeClient::from_env()?
-    .with_mcp_config("/etc/agent/mcp.json")
-    .with_args(["--allowedTools", "mcp__search__query"]);
-let agent = client.agent(models::SONNET).build();
-# let _ = agent;
+#[derive(Deserialize)]
+struct Args { sku: String }
+
+#[derive(Debug, thiserror::Error)]
+#[error("lookup failed")]
+struct LookupError;
+
+struct LookupPrice;
+
+impl Tool for LookupPrice {
+    const NAME: &'static str = "lookup_price";
+    type Args = Args;
+    type Output = String;
+    type Error = LookupError;
+    fn description(&self) -> String { "The price of a product, by SKU.".into() }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object","properties":{"sku":{"type":"string"}},"required":["sku"]})
+    }
+    async fn call(&self, _: &mut ToolContext, args: Args) -> Result<String, LookupError> {
+        Ok(format!("price of {}: $14.20", args.sku))
+    }
+}
+
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let agent = ClaudeCodeClient::from_env()?
+    .agent(models::HAIKU)
+    .tool(LookupPrice)
+    .default_max_turns(4)
+    .build();
+println!("{}", agent.prompt("How much is SKU A-113?").await?);
 # Ok(())
 # }
 ```
 
-A non-interactive `claude -p` run calls only tools on its allow-list. MCP
-tools stay under the CLI's control. rig never sees them or their calls, and
-the crate still refuses a rig tool registered on the agent.
+This example needs the `serde` and `thiserror` crates. `cargo run --example
+tool_loop` runs it against a real binary.
+
+Set `default_max_turns` to at least two. rig's default is one model turn, and
+a tool call needs one turn to ask and one to answer with the result in hand.
+
+### How the loop works
+
+The CLI is an agent harness of its own. When its model emits a tool call, the
+harness looks the tool up, and if it finds none it tells the model the tool
+does not exist. So the crate cannot describe tools in the prompt and read the
+calls back from the text: the model reaches for a real tool call, the harness
+rejects it, and the model reports the tool as broken.
+
+Instead, for each turn that carries rig tools, the crate binds a loopback
+HTTP listener, serves MCP on it with rig's tool definitions, and points the
+CLI at it. The server executes nothing. It records each call the CLI makes
+and answers with an acknowledgement. The turn's response then carries the
+recorded calls, and rig runs its own tool implementations, appends the
+results, and asks again. Tool calls and results appear in the next turn's
+prompt in full, so the model sees what it asked and what came back.
+
+The consequences for a caller:
+
+- Tools run in your process, with rig's hooks and permissions, exactly as with
+  any other provider.
+- Each turn that carries tools opens a loopback port for its duration.
+- The model's text on a turn that made calls is discarded, since it was
+  written before any result existed. rig's runner asks again.
+- `tool_choice` `Auto` and `None` are honored. `Required` and `Specific` are
+  refused: the CLI's harness decides whether the model calls a tool.
+
+`with_mcp_config` still passes an MCP server of your own to the CLI, and its
+tools run inside the CLI as before. The two mechanisms coexist.
 
 ## Handle a failed turn
 
@@ -253,15 +314,16 @@ the source walk.
 ## Reference: what the transport does not do
 
 The CLI takes a prompt, a system prompt, a model, and an output schema. It
-takes no tool definitions and no sampling parameters. The crate refuses each
+takes no sampling parameters. Tools reach it through a per-turn MCP server
+(see [Give the model tools](#give-the-model-tools)). The crate refuses each
 unsupported request setting with an error. It never drops one silently.
 
 | Setting | Why the crate refuses it |
 | --- | --- |
-| Tools | The CLI accepts no tool definitions. Use [MCP](#give-the-model-tools). This also rules out `OutputMode::Tool` and rig's `ExtractorBuilder`, which use a synthetic output tool. |
 | `temperature`, `max_tokens` | The CLI has no such flags. |
 | `additional_params` | The CLI has no request body to extend. |
-| `tool_choice` other than `None` | No tools are advertised, so any other choice asks for a call that cannot happen. |
+| `tool_choice` of `Required` or `Specific` | The CLI's harness decides whether the model calls a tool. `Auto` and `None` are honored. |
+| `OutputMode::Tool` and `ExtractorBuilder` | Both need a forced call to a synthetic output tool, which is `tool_choice: Required`. Use `prompt_typed` on an agent without tools instead. |
 | A last message with no text | The CLI needs a prompt. A transcript with nothing after it is answered as if it were the question. |
 | An output schema over 96 KiB | The schema is passed as one argument, and Linux caps an argument at 128 KiB. |
 
