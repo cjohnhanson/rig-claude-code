@@ -45,6 +45,9 @@ pub struct FakeClaudeBuilder {
     system_prompt_delay: Option<f32>,
     /// Emit this stdout fixture forever, pausing between repeats.
     repeat_forever: Option<f32>,
+    /// Let a backgrounded grandchild write the stdout fixture, this many
+    /// seconds after the child itself has exited.
+    orphan_writes_after: Option<f32>,
     orphan_seconds: Option<f32>,
     sentinel_after: Option<f32>,
 }
@@ -74,6 +77,7 @@ impl FakeClaude {
             ignore_sigpipe: false,
             system_prompt_delay: None,
             repeat_forever: None,
+            orphan_writes_after: None,
             orphan_seconds: None,
             sentinel_after: None,
         }
@@ -253,6 +257,17 @@ impl FakeClaudeBuilder {
         self
     }
 
+    /// Have a backgrounded grandchild write the stdout fixture `delay` after
+    /// the child exits, holding the pipe open in the meantime.
+    ///
+    /// This is the shape where the answer only arrives during the grace
+    /// period, after the child is already gone.
+    #[must_use]
+    pub fn orphan_writes_after(mut self, delay: Duration) -> Self {
+        self.orphan_writes_after = Some(delay.as_secs_f32());
+        self
+    }
+
     /// Repeat the stdout fixture forever, pausing `interval` between repeats.
     #[must_use]
     pub fn repeat_forever(mut self, interval: Duration) -> Self {
@@ -335,6 +350,13 @@ impl FakeClaudeBuilder {
             "cat \"$here/stderr\" >&2 || echo failed > \"$here/write_failed\"\n".to_owned();
         let emit_stdout = match self.repeat_forever {
             Some(interval) => format!("while :; do {emit_stdout}sleep {interval}; done\n"),
+            None => emit_stdout,
+        };
+
+        let emit_stdout = match self.orphan_writes_after {
+            Some(seconds) => {
+                format!("( sleep {seconds}; cat \"$here/stdout\" ) &\n")
+            }
             None => emit_stdout,
         };
 

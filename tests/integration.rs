@@ -979,6 +979,26 @@ async fn cancelling_a_turn_leaves_no_task_behind() {
 }
 
 #[tokio::test]
+async fn output_that_only_arrives_after_the_child_exits_is_still_used() {
+    // A grandchild flushing the envelope after its parent is gone. The fast
+    // path finds nothing at exit, so the grace period is what recovers the
+    // answer — the case the grace exists for, as opposed to the grandchild
+    // that merely holds the pipe.
+    let fake = FakeClaude::builder()
+        .stdout(&envelope("late but present"))
+        .orphan_writes_after(Duration::from_millis(300))
+        .build();
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let response = tokio::time::timeout(Duration::from_secs(60), model.completion(request("hi")))
+        .await
+        .expect("the grace period must recover it")
+        .unwrap();
+
+    assert_eq!(text_of(&response), "late but present");
+}
+
+#[tokio::test]
 async fn a_non_zero_exit_still_quotes_stderr_a_grandchild_delayed() {
     // Stderr never reaches end-of-file while a grandchild holds it, so the
     // grace elapses. Discarding what was read at that point throws away the
