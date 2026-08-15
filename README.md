@@ -2,62 +2,99 @@
 
 [![CI](https://github.com/cjohnhanson/rig-claude-code/actions/workflows/ci.yml/badge.svg)](https://github.com/cjohnhanson/rig-claude-code/actions/workflows/ci.yml)
 
-A [rig](https://github.com/0xPlaygrounds/rig) completion model backed by the
-Claude Code CLI.
+A [rig](https://github.com/0xPlaygrounds/rig) model provider that runs the
+Claude Code CLI. Turns draw on a Claude subscription, not on API credits.
 
-**Unofficial.** Not affiliated with or endorsed by Anthropic or by
-0xPlaygrounds, who maintain rig and its `rig-*` integration crates.
+**Unofficial.** This crate is not affiliated with Anthropic or with
+0xPlaygrounds, who maintain rig.
 
-rig's Anthropic provider authenticates with an API key. This one does not. It
-runs the local `claude` binary in print mode, so the credential is whatever
-Claude Code is already logged in with. Anthropic's help centre states that
-`claude -p` usage draws on a subscription's usage limits — see [Use Claude Code
-with your Pro or Max plan][cc-plan] — so on a subscription login, no API
-credits are spent. That was true of Claude Code 2.1.233 in August 2026; check
-it yourself before relying on it.
+## Contents
+
+1. [Who this is for](#who-this-is-for)
+2. [Install and run the first turn](#install-and-run-the-first-turn)
+3. [Configure the client](#configure-the-client)
+4. [Stream a response](#stream-a-response)
+5. [Get structured output](#get-structured-output)
+6. [Give the model tools](#give-the-model-tools)
+7. [Handle a failed turn](#handle-a-failed-turn)
+8. [Reference: what the transport does not do](#reference-what-the-transport-does-not-do)
+9. [Reference: environment and trust](#reference-environment-and-trust)
+10. [Explanation: why the invocation looks the way it does](#explanation-why-the-invocation-looks-the-way-it-does)
+11. [Test](#test)
+12. [Compatibility](#compatibility)
+13. [Terms of service and license](#terms-of-service-and-license)
+
+## Who this is for
+
+Use this crate when you want rig's agent, RAG, and memory features, and you
+want each turn billed to a Claude subscription. It suits a small number of
+sequential turns on a machine that has an interactive Claude Code login.
+
+Use rig's own Anthropic provider instead when you need tool-calling agents,
+sampling parameters, high concurrency, or a server with no logged-in CLI.
+
+Anthropic's help centre states that `claude -p` usage draws on a
+subscription's usage limits ([Use Claude Code with your Pro or Max
+plan][cc-plan]). That statement held for Claude Code 2.1.233 in August 2026.
+Check it before you rely on it.
 
 [cc-plan]: https://support.claude.com/en/articles/11145838-use-claude-code-with-your-pro-or-max-plan
 
-**Reach for this** when you want rig's agent, RAG, and memory plumbing with
-turns drawn from a Claude subscription rather than API credits, for a modest
-number of sequential turns on a machine that has an interactive Claude Code
-login. **Reach for rig's own Anthropic provider instead** for tool-calling
-agents, sampling control, high concurrency, or any server without a logged-in
-CLI.
+## Install and run the first turn
 
-**Prerequisite:** a `claude` binary on `PATH` that is already logged in.
-Install Claude Code and run `claude` once interactively to log in.
+1. Install Claude Code. Run `claude` once and log in. The crate needs a
+   `claude` binary on `PATH` that is already logged in.
 
-```rust,no_run
-use std::time::Duration;
-use rig::completion::Prompt;
-use rig::prelude::*;
-use rig_claude_code::{ClaudeCodeClient, models};
+2. Add the dependencies. The crate is not on crates.io yet.
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // `from_env` runs `claude --version` synchronously to confirm the binary
-    // works. Call it during setup, not on a hot async path.
-    let client = ClaudeCodeClient::from_env()?
-        .with_timeout(Duration::from_secs(120));
+   ```toml
+   [dependencies]
+   rig-claude-code = { git = "https://github.com/cjohnhanson/rig-claude-code" }
+   rig = "0.41"
+   tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+   ```
 
-    let agent = client
-        .agent(models::HAIKU)
-        .preamble("You are terse.")
-        .build();
+3. Build a client, build an agent, and prompt it.
 
-    println!("{}", agent.prompt("Say hello.").await?);
-    Ok(())
-}
-```
+   ```rust,no_run
+   use std::time::Duration;
+   use rig::completion::Prompt;
+   use rig::prelude::*;
+   use rig_claude_code::{ClaudeCodeClient, models};
 
-The client implements the same traits as a built-in provider —
-`ProviderClient`, `CompletionClient`, `VerifyClient` — so
-`client.completion_model(..)` and `client.verify()` work directly, and
-`client.agent(..)` works through rig's `AgentClientExt`, which the `rig`
-crate's default `agent` feature brings in.
+   #[tokio::main]
+   async fn main() -> Result<(), Box<dyn std::error::Error>> {
+       let client = ClaudeCodeClient::from_env()?
+           .with_timeout(Duration::from_secs(120));
 
-Every setting lives on the client and is inherited by each agent it builds:
+       let agent = client
+           .agent(models::HAIKU)
+           .preamble("You are terse.")
+           .build();
+
+       println!("{}", agent.prompt("Say hello.").await?);
+       Ok(())
+   }
+   ```
+
+`from_env` runs `claude --version` on the calling thread to confirm the binary
+works. Call it during setup. `ClaudeCodeClient::new` followed by
+`version().await` does the same check without blocking. Neither call confirms
+the CLI is logged in. Only a real turn confirms that; a logged-out CLI fails
+the first turn with a refusal envelope (see [Handle a failed
+turn](#handle-a-failed-turn)).
+
+Each turn starts a Node process. On one machine against Claude Code 2.1.233,
+a one-word `haiku` turn took 2.3 to 2.7 seconds wall clock against about one
+second of model time. Expect about 1.5 seconds of process overhead per turn.
+
+The client implements `ProviderClient`, `CompletionClient`, and
+`VerifyClient`. `client.agent(..)` comes from rig's `AgentClientExt`, which the
+`rig` crate's default `agent` feature provides.
+
+## Configure the client
+
+Every setting lives on the client. Each agent the client builds inherits them.
 
 ```rust,no_run
 use std::time::Duration;
@@ -67,59 +104,35 @@ use rig_claude_code::{ClaudeCodeClient, models};
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let client = ClaudeCodeClient::from_env()?
     .with_timeout(Duration::from_secs(120))
-    .with_mcp_config("/etc/agent/mcp.json")
-    .with_current_dir("/srv/workspace");
+    .with_current_dir("/srv/workspace")
+    .with_args(["--max-budget-usd", "0.50"]);
 
-let agent = client.agent(models::HAIKU).build();
+let agent = client.agent(models::SONNET).build();
 # let _ = agent;
 # Ok(())
 # }
 ```
 
-`ClaudeCodeModel` carries the same `with_*` methods for building a model
-directly. `rig_claude_code::Client` and `rig_claude_code::CompletionModel`
-alias the two types under the names the rig ecosystem uses.
+| Setting | Effect |
+| --- | --- |
+| `with_timeout` | Kills the child and fails the turn after this long. There is no default; without one, a wedged child waits forever. |
+| `with_current_dir` | Runs the child in this directory. |
+| `with_args` | Appends arguments to the CLI invocation. An argument that collides with a flag the crate sets is refused. |
+| `with_mcp_config` | Passes an MCP server configuration. See [Give the model tools](#give-the-model-tools). |
+| `with_binary` (on `ClaudeCodeModel`) | Runs a specific binary instead of the one on `PATH`. |
 
-## Install
+`RIG_CLAUDE_CODE_BIN` names the binary for `from_env` when it is not on
+`PATH`. `ClaudeCodeModel` carries the same `with_*` methods for building a
+model directly. `rig_claude_code::Client` and `rig_claude_code::CompletionModel`
+are aliases for the two types, under the names the rig ecosystem uses.
 
-Not yet on crates.io. Until it is, depend on the repository:
+`models` exports the aliases `HAIKU`, `SONNET`, `OPUS`, and `FABLE`. Each one
+tracks the latest model in its family. Pass a full model id, such as
+`claude-haiku-4-5-20251001`, to pin a turn to one version. The CLI's help
+lists `fable`, `opus`, and `sonnet`. `haiku` is accepted but not listed, so it
+is the alias most likely to change.
 
-```toml
-[dependencies]
-rig-claude-code = { git = "https://github.com/cjohnhanson/rig-claude-code" }
-rig = "0.41"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-```
-
-The streaming example below also needs `futures`; the structured-output
-example needs `serde` and `schemars`.
-
-`ClaudeCodeClient::from_env` reads `RIG_CLAUDE_CODE_BIN` to find the binary
-somewhere other than `PATH`; `ClaudeCodeModel::with_binary` is the equivalent
-when building a model directly. `from_env` and `verify()` confirm the binary
-runs — they cannot confirm it is logged in, which only a real turn
-establishes. A logged-out CLI fails the first turn with a refusal envelope
-(see *Failed turns*). `from_env` blocks the calling thread while
-`claude --version` runs; `ClaudeCodeClient::new` plus `version().await` is the
-non-blocking equivalent.
-
-A turn needs a tokio runtime with I/O and time enabled, which
-`#[tokio::main]` and `Runtime::new()` both provide. Each turn starts a Node
-process. Measured on one machine against 2.1.233, a one-word `haiku` turn took
-2.3–2.7 s wall clock against about 1 s of model time: roughly 1.5 s of
-per-turn process overhead, which is the largest practical difference from an
-HTTP provider.
-
-## Choosing a model
-
-The string goes to the CLI's `--model`. `rig_claude_code::models` exports the
-aliases `HAIKU`, `SONNET`, `OPUS`, and `FABLE`, each tracking the latest model
-in its family. A full model id such as `claude-haiku-4-5-20251001` pins a turn
-to one version. The CLI's own help advertises `fable`, `opus`, and `sonnet`;
-`haiku` is accepted too — verified by a real turn — but being undocumented it
-is the one most likely to change.
-
-## Streaming
+## Stream a response
 
 ```rust,no_run
 use futures::StreamExt as _;
@@ -143,26 +156,14 @@ while let Some(item) = stream.next().await {
 # }
 ```
 
-`examples/shipping_forecast.rs` runs the blocking, multi-turn, and streaming
-paths against a real binary.
+This example needs the `futures` crate. `examples/shipping_forecast.rs` runs
+the blocking, multi-turn, and streaming paths against a real binary.
 
-## Structured output
+## Get structured output
 
-The CLI has a `--json-schema` flag, so native structured output works and needs
-no special mode. `OutputMode::Auto`, the default, resolves to `Native` for an
-agent with no tools — and this transport carries no tools (see *What the
-transport cannot do*), so it always does. schemars stamps every schema with a
-`$schema` pointer to the 2020-12 metaschema, which Claude Code 2.1.233's
-validator cannot resolve and rejects outright; the crate strips that one key
-before passing the schema, and nothing else.
-
-**Blocking only.** The CLI enforces a schema as a second internal turn after
-the model's first answer. A blocking turn returns the enforced JSON. A
-*streaming* turn yields the model's first, unconstrained answer as text
-deltas, and the enforced JSON appears only in the terminal frame — so
-`stream_prompt` on a schema-bearing agent streams prose, not JSON. Use the
-blocking path for structured output. `cargo run --example typed_output`
-exercises it against a real binary.
+Structured output works on the blocking path. Set no mode; the default
+`OutputMode::Auto` resolves to native structured output because the transport
+carries no tools.
 
 ```rust,no_run
 use rig::completion::TypedPrompt;
@@ -185,127 +186,17 @@ let person: Person = agent.prompt_typed("Describe Ada Lovelace.").await?;
 # }
 ```
 
-## What the transport cannot do
+This example needs the `serde` and `schemars` crates. `cargo run --example
+typed_output` runs it against a real binary.
 
-The CLI takes a prompt, a system prompt, a model, and an output schema. It
-takes no tool definitions and no sampling parameters. Every unsupported
-*request setting* is rejected with an error rather than dropped, because a
-silently ignored `max_tokens` is harder to diagnose than a refused request. The
-cause is a `rig_claude_code::UnsupportedSetting`, so a caller can `downcast_ref`
-and fall back to another provider instead of matching on message text.
+Do not stream a schema-bearing agent. The CLI enforces a schema in a second
+internal turn, so a streamed turn yields the model's first, unconstrained
+answer as text. The enforced JSON arrives only in the terminal frame.
 
-| Setting | Why not |
-| --- | --- |
-| Tools | The CLI accepts no tool definitions as arguments. Its route to tools is MCP: `with_mcp_config` passes a server config, and those tools stay under the CLI's control. This also rules out `OutputMode::Tool` and rig's `ExtractorBuilder`, both of which use a synthetic output tool. |
-| `temperature`, `max_tokens` | No flags exist. |
-| `additional_params` | There is no request body to extend. |
-| Non-`None` `tool_choice` | No tools are advertised, so any other choice asks for a call that cannot happen. |
-| A last message with no text | The CLI needs a prompt, and a transcript with nothing after it is answered as if it were the question. |
-| An output schema over 96 KiB | It is the one caller-sized value still passed as an argument, and Linux caps one at 128 KiB. |
+## Give the model tools
 
-**Message content is text.** Images, audio, video, document blocks, and tool
-results cannot cross the prompt, so each is replaced by a visible placeholder —
-`[an image was omitted: this transport sends text only]` — rather than dropped.
-A model told that a picture was omitted behaves very differently from one shown
-a message with a hole in it.
-
-**History is flattened, not replayed.** The CLI takes one prompt, so prior
-turns are rendered into it as a labelled transcript. Every marker — the section
-tags, the `user`/`assistant` labels, each document's wrapper — carries a
-per-request nonce, so message text cannot forge a turn or close a section
-early. Two consequences worth knowing: a `Message::System` anywhere in the
-history is hoisted into the system prompt, so an instruction injected after
-turn three arrives as if it had been there from the start; and a trailing
-`Message::System` is sent as the system prompt *and* as the prompt. Each turn
-is a fresh process. The `session_id` the CLI reports is surfaced as rig's
-`message_id` for observability only; feeding it back does not resume anything.
-
-## Failed turns
-
-A usage limit, a rate limit, a logged-out CLI, and an unrecognized model all
-arrive as a well-formed envelope on stdout, often alongside exit 1. The
-envelope is a failure when *either* its `is_error` flag is set *or* its
-`subtype` begins with `error` — the two are not always set together, and a
-usage-limit envelope has been seen with `is_error: true` and `subtype:
-"success"`. The crate reads the envelope before the exit status so the
-explanation is never lost, and returns it as
-`CompletionError::ProviderResponse` with the whole envelope as the body. Branch
-on the envelope rather than on message text — and check both fields, as the
-crate does:
-
-```rust,no_run
-use rig::completion::CompletionError;
-
-# fn handle(error: &CompletionError) {
-if let Ok(Some(body)) = error.provider_response_json() {
-    match body.get("subtype").and_then(|s| s.as_str()) {
-        Some("error_max_turns") => { /* raise the budget and retry */ }
-        Some(other) => eprintln!("claude refused: {other}"),
-        None => {}
-    }
-}
-# }
-```
-
-Through an agent the error is a `PromptError` wrapping the `CompletionError`;
-match `PromptError::CompletionError(inner)` first, or walk `Error::source`.
-The same applies to `UnsupportedSetting`, whose rustdoc shows the walk.
-
-## Why the invocation looks the way it does
-
-A plain `claude -p` loads the full Claude Code agent system prompt, the
-project's `CLAUDE.md`, configured MCP servers, and skills. Measured against
-Claude Code 2.1.233, a one-word prompt costs about 42,000 input tokens that
-way. This crate passes `--tools ""`, `--strict-mcp-config`,
-`--setting-sources ""`, and `--disable-slash-commands`, which brings the same
-prompt to about 165.
-
-`--bare` looks like it belongs in that list and does not: it forces
-authentication through `ANTHROPIC_API_KEY` and never reads the subscription
-credential, which would defeat the point.
-
-Neither the prompt nor the system prompt is passed as an argument. The prompt
-goes to standard input; the system prompt goes to a 0600 temporary file named
-by `--system-prompt-file`. Three reasons, all verified against 2.1.233:
-
-1. **Injection.** Any argv element beginning with `-` is parsed as an option,
-   and `--flag=value` splits on the first `=`. A prompt of
-   `--settings={"hooks":…"command":"touch /tmp/proof"…}` executed that command
-   before any API call. The CLI also scans raw argv for `--settings=` ahead of
-   its own parsing, so the payload fires from an option *value* too, and an
-   end-of-options `--` does not stop it.
-2. **Length.** Linux caps a single argument at 128 KiB. A flattened transcript
-   passes that easily and fails with `E2BIG`, which reads like a missing
-   binary — on Linux only, so it never shows up on a developer's Mac.
-3. **Exposure.** Argv is world-readable through `/proc` and `ps`. For a RAG
-   agent that would expose every retrieved document.
-
-`CLAUDECODE` is removed from the child's environment, so a `claude` launched
-from inside a Claude Code session does not treat itself as nested.
-
-## Process lifetime
-
-Every turn is one child process, killed when the future or stream driving it is
-dropped — so an abandoned turn does not leave a `claude` running and spending
-the login's usage. That kill reaches the child, not its descendants: an MCP
-server the CLI started may outlive the turn. There is no default timeout; set
-`with_timeout` on the client or model to bound a turn that never finishes on
-its own. The bound covers the whole turn, including the short grace periods
-spent draining pipes after the child exits.
-
-A blocking turn retains at most 16 MiB of output and reports an overflow as a
-size limit, not a parse failure. A streaming turn has no total cap; a single
-frame over 16 MiB with no newline fails the stream with a read error.
-
-Concurrent turns are concurrent processes. Each one starts a Node runtime, so
-the practical ceiling is much lower than for an HTTP provider.
-
-## Tools through MCP
-
-`with_mcp_config` is the route to tools, and the invocation pairs it with
-`--strict-mcp-config` so nothing else is loaded. A non-interactive `-p` run
-only calls a tool the caller has pre-approved, so name them through
-`with_args`:
+The transport accepts no rig tool definitions. The CLI's route to tools is
+MCP. Pass a server configuration, and name each tool the CLI may call:
 
 ```rust,no_run
 use rig::prelude::*;
@@ -321,80 +212,191 @@ let agent = client.agent(models::SONNET).build();
 # }
 ```
 
-The crate's `--tools ""` disables the CLI's *built-in* tools only; MCP tools
-are governed by the config and the allow-list. They stay under the CLI's
-control — rig never sees them, never observes their calls, and registering a
-rig tool on the agent still fails.
+A non-interactive `claude -p` run calls only tools on its allow-list. The
+tools stay under the CLI's control: rig does not see them, does not observe
+their calls, and a rig tool registered on the agent is still refused.
 
-## Trust model
+## Handle a failed turn
 
-The binary runs with the host process's full privileges, so both `PATH` and
-`RIG_CLAUDE_CODE_BIN` are **trusted configuration**, equivalent to naming code
-to execute. Prefer an absolute path. Note that `from_env` runs the binary
-immediately, so constructing a client executes whatever the variable names.
+A usage limit, a rate limit, a logged-out CLI, and an unrecognized model each
+produce an envelope on the CLI's standard output. The crate treats an envelope
+as a failure when its `is_error` flag is set, or when its `subtype` begins with
+`error`. The two fields do not always agree; a usage-limit envelope has been
+seen with `is_error: true` and `subtype: "success"`.
 
-The child inherits the environment, minus the ten variables a live Claude Code
-session exports to mark itself (`CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`,
-`CLAUDE_CODE_MESSAGING_TOKEN`, `CLAUDE_EFFORT`, and the rest — matched by exact
-name, listed in `src/model.rs`). `CLAUDE_EFFORT` in particular would silently
-change the effort level and cost of every turn depending on who launched the
-host process. Everything else the CLI honors reaches the child, on purpose,
-because it is the caller's to control — including the variables that *select
-the credential*: `CLAUDE_CONFIG_DIR` (which account's login is used),
-`CLAUDE_CODE_USE_BEDROCK` / `CLAUDE_CODE_USE_VERTEX` (a different backend),
-`ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` (bill an API account rather than
-the subscription), `ANTHROPIC_BASE_URL` (send every prompt elsewhere), and
-`ANTHROPIC_MODEL`.
+The crate returns the whole envelope as `CompletionError::ProviderResponse`.
+Branch on the envelope, not on message text:
 
-Supported on Unix. Windows is untested and not covered by CI.
+```rust,no_run
+use rig::completion::CompletionError;
 
-## Testing
-
-```console
-cargo test          # unit, integration, and doc tests — spends no usage
-cargo llvm-cov      # coverage
-cargo clippy --all-targets
+# fn handle(error: &CompletionError) {
+if let Ok(Some(body)) = error.provider_response_json() {
+    match body.get("subtype").and_then(|s| s.as_str()) {
+        Some("error_max_turns") => { /* raise the budget and retry */ }
+        Some(other) => eprintln!("claude refused: {other}"),
+        None => {}
+    }
+}
+# }
 ```
 
-The integration suite drives a scripted stand-in for the `claude` binary, so it
-asserts on the real spawned argument vector, what crossed standard input, the
-child's environment, exit-status handling, and process lifetime — without
-spending any usage. It reproduces the shapes a naive double cannot: output that
-arrives in stages, a flood of standard error ahead of the frames, a grandchild
-that outlives the child holding its pipes open, and a child abandoned
-mid-turn. Those tests are Unix-only because the stand-in is a shell script.
+Through an agent, the error arrives as a `PromptError` that wraps the
+`CompletionError`. Match `PromptError::CompletionError(inner)` first, or walk
+`Error::source`.
 
-`cargo run --example shipping_forecast` exercises a real binary and does spend
-usage.
+A refused request setting arrives as `CompletionError::RequestError` with an
+`UnsupportedSetting` as its source. The rustdoc for `UnsupportedSetting` shows
+the source walk.
+
+## Reference: what the transport does not do
+
+The CLI takes a prompt, a system prompt, a model, and an output schema. It
+takes no tool definitions and no sampling parameters. The crate refuses each
+unsupported request setting with an error. It never drops one silently.
+
+| Setting | Why the crate refuses it |
+| --- | --- |
+| Tools | The CLI accepts no tool definitions. Use [MCP](#give-the-model-tools). This also rules out `OutputMode::Tool` and rig's `ExtractorBuilder`, which use a synthetic output tool. |
+| `temperature`, `max_tokens` | The CLI has no such flags. |
+| `additional_params` | The CLI has no request body to extend. |
+| `tool_choice` other than `None` | No tools are advertised, so any other choice asks for a call that cannot happen. |
+| A last message with no text | The CLI needs a prompt. A transcript with nothing after it is answered as if it were the question. |
+| An output schema over 96 KiB | The schema is passed as one argument, and Linux caps an argument at 128 KiB. |
+
+**Message content is text.** The crate replaces an image, audio, video,
+document block, or tool result with a visible placeholder such as `[an image
+was omitted: this transport sends text only]`. The model is told what was
+left out.
+
+**History is flattened, not replayed.** The CLI takes one prompt, so the crate
+renders prior turns into it as a labelled transcript. Every marker in the
+transcript carries a per-request nonce, so message text cannot forge a turn
+or close a section early. Two consequences follow. A `Message::System`
+anywhere in the history moves into the system prompt. A trailing
+`Message::System` is sent as the system prompt and as the prompt.
+
+**Each turn is a fresh process.** The `session_id` the CLI reports appears as
+rig's `message_id`, for observability only. Feeding it back resumes nothing.
+
+**Output is bounded.** A blocking turn keeps at most 16 MiB of output and
+reports an overflow as a size limit. A streaming turn has no total cap; one
+frame over 16 MiB with no newline fails the stream with a read error.
+
+**The child is killed on drop.** Dropping the future or stream that drives a
+turn kills the child, so an abandoned turn does not keep spending usage. The
+kill reaches the child, not its descendants; an MCP server the CLI started can
+outlive the turn. Concurrent turns are concurrent processes.
+
+**Unix only.** Windows is untested and not covered by CI.
+
+## Reference: environment and trust
+
+The binary runs with the host process's full privileges. `PATH` and
+`RIG_CLAUDE_CODE_BIN` are trusted configuration; either one names code to
+execute. Prefer an absolute path. `from_env` runs the binary at once, so
+constructing a client executes whatever the variable names.
+
+The child inherits the environment except for the ten variables a live Claude
+Code session exports to mark itself: `CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`,
+`CLAUDE_CODE_CHILD_SESSION`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_EXECPATH`,
+`CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN`, `CLAUDE_PID`,
+`CLAUDE_EFFORT`, and `AI_AGENT`. The crate removes these by exact name.
+`CLAUDE_EFFORT` would otherwise change the effort level and cost of every turn
+according to who launched the host process.
+
+Every other variable the CLI honors reaches the child. Several of them select
+the credential or the endpoint, and the crate leaves them alone on purpose:
+
+| Variable | Effect on the turn |
+| --- | --- |
+| `CLAUDE_CONFIG_DIR` | Selects which account's login is used. |
+| `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX` | Route the turn to a different backend. |
+| `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` | Bill an API account instead of the subscription. |
+| `ANTHROPIC_BASE_URL` | Send every prompt to a different endpoint. |
+| `ANTHROPIC_MODEL` | Override the model. |
+
+## Explanation: why the invocation looks the way it does
+
+**The flags.** A plain `claude -p` loads the full Claude Code agent system
+prompt, the project's `CLAUDE.md`, configured MCP servers, and skills. Against
+Claude Code 2.1.233, a one-word prompt cost about 42,000 input tokens that
+way. The crate passes `--tools ""`, `--strict-mcp-config`,
+`--setting-sources ""`, and `--disable-slash-commands`. The same prompt then
+costs about 165 tokens. `--bare` is not in that list because it forces
+authentication through `ANTHROPIC_API_KEY` and never reads the subscription
+credential.
+
+**The prompt is on standard input, and the system prompt is in a file.**
+Neither is passed as an argument, for three reasons, each verified against
+2.1.233.
+
+1. Injection. The CLI parses any argument that begins with `-` as an option,
+   and it splits `--flag=value` on the first `=`. A prompt of
+   `--settings={"hooks":…"command":"touch /tmp/proof"…}` executed that
+   command before any API call. The CLI also scans raw argv for `--settings=`
+   before its own option parsing, so the payload fires from an option value
+   too, and an end-of-options `--` does not stop it.
+2. Length. Linux caps one argument at 128 KiB. A flattened transcript exceeds
+   that and fails with `E2BIG`, which reads like a missing binary. macOS
+   allows more, so the failure appears only on Linux.
+3. Exposure. Arguments are readable through `/proc` and `ps`. For a RAG
+   agent, that would expose every retrieved document.
+
+The system prompt file is created with mode 0600 and passed as
+`--system-prompt-file`. That flag is not in the CLI's option list in 2.1.233;
+it appears only inside the description of `--bare`. It works, and the crate
+depends on it.
+
+**The schema loses its `$schema` key.** schemars stamps every schema with a
+pointer to the 2020-12 metaschema. The CLI's validator cannot resolve that URI
+and rejects the schema. The crate removes that one key and nothing else.
+
+**Envelope before exit status.** The CLI reports a usage limit, a rate limit,
+or an unrecognized model as an envelope on standard output together with exit
+code 1, and its standard error is often empty. The crate reads the envelope
+first so the explanation is never lost. A successful envelope beside a failed
+exit is still a failure.
+
+## Test
+
+```console
+cargo test                 # spends no usage
+cargo clippy --all-targets
+cargo llvm-cov             # coverage
+```
+
+The integration suite drives a scripted stand-in for the `claude` binary. It
+asserts on the real spawned argument vector, on what crossed standard input,
+on the child's environment, on exit-status handling, and on process lifetime.
+The stand-in reproduces shapes a naive double cannot: output that arrives in
+stages, a flood of standard error before the frames, a grandchild that holds
+the pipes open after the child exits, and a child abandoned mid-turn. Those
+tests are Unix-only because the stand-in is a shell script.
+
+`cargo run --example shipping_forecast` and `cargo run --example
+typed_output` run against a real binary and spend usage.
 
 ## Compatibility
 
 Built against rig 0.41 and Claude Code 2.1.233. rig ships breaking changes on
-most minor releases, so treat the version pin as load-bearing. The MSRV of
-1.88 is set by this crate's own use of let chains on edition 2024; rig-core
-declares no MSRV of its own, so its floor can move independently. One trait
-detail: `ProviderClient::Error` is this crate's `ClientError` rather than rig's
-`ProviderClientError`, so generic code bounded on the latter will not take this
-client. The
-CLI's flags and output shape are likewise a moving target; the response types
-keep unknown fields rather than rejecting them, and a `null` or fractional
-value where a number is expected is tolerated rather than fatal.
+most minor releases, so pin it. The CLI's flags and output shape also change;
+the response types keep unknown fields, and they accept a `null` or fractional
+value where a number is expected.
 
-One flag deserves naming: `--system-prompt-file`, which carries the injection
-defence, is not in `claude --help`'s option list in 2.1.233 — it appears only
-inside the `--bare` description. It works, but losing it would take the crate
-out rather than degrade it.
+The MSRV is 1.88, set by this crate's use of let chains on edition 2024.
+rig-core declares no MSRV of its own.
 
-## Terms of service
+`ProviderClient::Error` is this crate's `ClientError`, not rig's
+`ProviderClientError`. Generic code bounded on the latter will not accept this
+client.
 
-This crate shells out to the `claude` binary and parses its documented output.
-It performs no authentication bypass and no circumvention of Anthropic's terms.
-Anyone using it is expected to follow both the letter and the spirit of
-Anthropic's terms of service and usage policies, including the rules on what
-may authenticate with a Claude subscription — in particular, Anthropic does not
-permit third-party developers to offer their users access through someone
-else's subscription credentials.
+## Terms of service and license
 
-## License
+This crate runs the `claude` binary and parses its documented output. It
+performs no authentication bypass. Follow Anthropic's terms of service and
+usage policies, including the rules on what may authenticate with a Claude
+subscription. Anthropic does not permit a third-party developer to offer
+users access through the developer's own subscription credentials.
 
 MIT.

@@ -155,7 +155,7 @@ impl ClaudeCodeClient {
     ///
     /// Returns [`ClientError::BinaryNotRunnable`] when the binary cannot be
     /// started, and [`ClientError::BinaryFailed`] when it starts and exits
-    /// non-zero — which is what a path naming some other executable does.
+    /// non-zero, which is what a path naming some other executable does.
     pub async fn version(&self) -> Result<String, ClientError> {
         let output = tokio::process::Command::new(&self.binary)
             .arg("--version")

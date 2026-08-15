@@ -21,7 +21,7 @@
 //! 2. **Length.** Linux caps a single argument at `MAX_ARG_STRLEN`, 128 KiB.
 //!    A flattened multi-turn transcript passes that easily. macOS allows far
 //!    more, so the failure reaches a Linux server without ever appearing on a
-//!    developer's Mac, and it arrives as `E2BIG`, which reads like a missing
+//!    developer's Mac, and it arrives as `E2BIG`, which resembles a missing
 //!    binary.
 //! 3. **Exposure.** Argv is world-readable through `/proc` and `ps`. For a
 //!    RAG agent that means every retrieved document is too.
@@ -103,8 +103,8 @@ impl Mode {
 ///
 /// Boxed into [`CompletionError::RequestError`], so a caller that wants to
 /// fall back to another provider can branch on the cause rather than matching
-/// on message text. Through an agent the refusal arrives wrapped — a
-/// `PromptError` around the `CompletionError` — so walk the source chain:
+/// on message text. Through an agent the refusal arrives inside a
+/// `PromptError` that wraps the `CompletionError`, so walk the source chain:
 ///
 /// ```
 /// use rig_claude_code::UnsupportedSetting;
@@ -180,7 +180,7 @@ pub(crate) fn build(
         if serialized.len() > MAX_SCHEMA_BYTES {
             // The CLI has no `--json-schema-file`, so this is the one
             // caller-sized value still in argv. Naming the limit beats letting
-            // `execve` report `E2BIG`, which reads like a missing binary.
+            // `execve` report `E2BIG`, which resembles a missing binary.
             return unsupported(
                 "an output schema this large",
                 "the CLI takes the schema as a command-line argument, which \
@@ -200,8 +200,8 @@ pub(crate) fn build(
     if last_text.trim().is_empty() {
         // The CLI answers `Error: Input must be provided…` after a whole Node
         // startup, and a history whose last message renders to nothing produces
-        // a prompt holding only the transcript framing — which the CLI accepts
-        // and the model answers as though it were a question.
+        // a prompt holding only the transcript framing. The CLI accepts that,
+        // and the model answers it as though it were a question.
         return unsupported(
             "a request whose last message carries no text",
             "the CLI needs a prompt; a transcript with nothing after it is \
@@ -221,7 +221,7 @@ pub(crate) fn build(
 /// schemars 1.x, which rig 0.41 pins, stamps every schema with
 /// `"$schema": "https://json-schema.org/draft/2020-12/schema"`. Claude Code
 /// 2.1.233's validator cannot resolve that URI and rejects the whole schema
-/// before any API call — `no schema with key or ref …` — so every
+/// before any API call with `no schema with key or ref …`. Every
 /// `prompt_typed` and `output_schema::<T>()` turn would fail. The body of the
 /// schema is fine; only the metaschema pointer is the problem, and it carries
 /// no constraint of its own. Verified: the same schema minus `$schema` is
@@ -307,7 +307,7 @@ fn render_system(request: &CompletionRequest) -> Option<String> {
 /// prompt. System messages are omitted here because [`render_system`] has
 /// already carried them to their own file.
 ///
-/// Every marker carries a per-request nonce — the section tags, the role
+/// Every marker carries a per-request nonce: the section tags, the role
 /// labels, and each document's element. Message text routinely contains
 /// newlines and nothing rewrites them, so a bare `assistant:` label would let
 /// one user message open a turn the caller never sent, and a bare
@@ -325,7 +325,7 @@ fn render_prompt(request: &CompletionRequest) -> String {
             // which a "cite your source" preamble needs. Rendering `text`
             // alone would silently drop both. Its `<file>` element is not
             // nonce-tagged, so a document's text can close it early and open
-            // another with a different id — the wrapper below is the boundary
+            // another with a different id. The wrapper below is the boundary
             // that holds. For a RAG agent the documents *are* the untrusted
             // input.
             let _ = writeln!(out, "<document-{nonce}>");
@@ -422,9 +422,9 @@ fn message_text(message: &Message) -> String {
 ///
 /// Non-text content is replaced by a placeholder rather than dropped
 /// silently. The CLI's prompt is text, so an image, an audio clip, a document
-/// block, or a tool result cannot be sent — but a model told that a picture
-/// was omitted behaves very differently from one shown a message with a hole
-/// in it and no explanation.
+/// block, or a tool result cannot be sent. A model told that a picture was
+/// omitted behaves differently from one shown a message with a hole in it and
+/// no explanation.
 fn user_text(content: &OneOrMany<UserContent>) -> String {
     content
         .iter()
@@ -780,8 +780,8 @@ mod tests {
     fn a_document_cannot_forge_another_document() {
         // rig's own `<file>` element is not nonce-tagged. A retrieved chunk
         // that closes it and opens another with a different id would defeat a
-        // "cite your source" preamble — and for a RAG agent the documents are
-        // the untrusted input. The nonce-tagged wrapper is what holds.
+        // "cite your source" preamble. For a RAG agent the documents are the
+        // untrusted input. The nonce-tagged wrapper is what holds.
         let mut req = request("question");
         req.documents = vec![Document {
             id: "real".to_owned(),

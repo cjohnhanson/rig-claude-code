@@ -3,9 +3,9 @@
 //! With `--output-format stream-json --include-partial-messages`, the CLI
 //! wraps Anthropic's own streaming protocol: each line is a JSON object, and a
 //! line of `"type": "stream_event"` carries one protocol event under `event`.
-//! Everything this crate needs lives in three of them — `content_block_delta`
-//! for text and thinking, and the terminal `result` line for usage — so
-//! unrecognized frames are skipped rather than rejected. A newer CLI emitting
+//! The crate acts on three of them: `content_block_delta` for text and
+//! thinking, and the terminal `result` line for usage. It skips every other
+//! frame rather than rejecting it. A newer CLI emitting
 //! new frame types therefore does not break a stream.
 
 use rig_core::completion::CompletionError;

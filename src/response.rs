@@ -31,7 +31,7 @@ pub(crate) fn quote(bytes: &[u8]) -> String {
 ///
 /// `#[serde(default)]` alone covers only the absent case. An explicit `null`
 /// still fails, which turns one new `"usage": null` from a future CLI into a
-/// lost turn reported as unparseable output — the exact break this module's
+/// lost turn reported as unparseable output. That is the break this module's
 /// `extra` catch-all exists to prevent.
 fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
@@ -185,10 +185,10 @@ impl CliResponse {
     ///
     /// Either signal is enough. `is_error` is the CLI's own flag; the
     /// `subtype` is its classifier, and the failure subtypes all begin with
-    /// `error`. Requiring both would miss an envelope where the two disagree —
-    /// `is_error: true` with `subtype: "success"` is a shape the CLI's own
-    /// tooling produces for a usage limit — and an envelope where the flag is
-    /// simply absent, which `#[serde(default)]` reads as `false`.
+    /// `error`. Requiring both would miss an envelope where the two disagree.
+    /// The CLI produces `is_error: true` with `subtype: "success"` for a usage
+    /// limit. It would also miss an envelope where the flag is absent, which
+    /// `#[serde(default)]` reads as `false`.
     fn failed(&self) -> bool {
         self.is_error || self.subtype.starts_with("error")
     }
@@ -198,8 +198,8 @@ impl CliResponse {
     /// The whole envelope travels as the error's body rather than being
     /// flattened into a message. A usage limit, a rate limit, and an
     /// unrecognized model all arrive this way, and a caller that wants to back
-    /// off on one and fail hard on another needs to branch on `subtype` —
-    /// which a formatted string does not allow. rig exposes the body through
+    /// off on one and fail hard on another needs to branch on `subtype`. A
+    /// formatted string does not allow that. rig exposes the body through
     /// `provider_response_json`:
     ///
     /// ```no_run

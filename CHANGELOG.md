@@ -30,10 +30,10 @@ The public surface, in full:
   so without that every `prompt_typed` turn failed. A streamed turn yields the
   model's pre-enforcement prose; the enforced JSON is in the terminal frame.
 - `UnsupportedSetting`: a public, downcastable cause for every request setting
-  the transport cannot express — tool definitions, `temperature`, `max_tokens`,
+  the transport cannot express: tool definitions, `temperature`, `max_tokens`,
   `additional_params`, any `tool_choice` other than `None`, a last message with
-  no text, and an output schema over 96 KiB. Each is rejected rather than
-  silently dropped.
+  no text, and an output schema over 96 KiB. Each is refused rather than
+  dropped.
 - `models`: the `HAIKU`, `SONNET`, `OPUS`, and `FABLE` aliases.
 - `with_timeout`, `with_args`, `with_mcp_config`, and `with_current_dir` on
   both `ClaudeCodeClient` and `ClaudeCodeModel`. Settings on the client are
@@ -41,9 +41,9 @@ The public surface, in full:
   with a flag the crate sets are refused rather than silently overriding it.
 - `Client` and `CompletionModel`, the names the rig ecosystem uses for a
   provider's types, as aliases.
-- A failed turn — usage limit, rate limit, unrecognized model — is returned
-  as `CompletionError::ProviderResponse` carrying the CLI's whole envelope,
-  so a caller can branch on its `subtype`.
+- A failed turn (a usage limit, a rate limit, an unrecognized model) is
+  returned as `CompletionError::ProviderResponse` with the CLI's whole
+  envelope, so a caller can branch on its `subtype`.
 
 ### Security
 
@@ -66,16 +66,16 @@ The public surface, in full:
   its stderr as the body, never as `ProviderError`. rig's stream driver treats
   any `ProviderError` whose text contains "aborted" as a cancellation and ends
   the stream cleanly with no error item, and Node's own `AbortError` message
-  is "This operation was aborted" — so the CLI's most common failure text
+  is "This operation was aborted", so the CLI's most common failure text
   would have turned a failed streaming turn into an empty success.
-- Every marker in the flattened transcript — the section tags, the role
-  labels, each document's wrapper — carries a per-request nonce keyed by a
-  per-process salt, so message content can neither close a section early nor
+- Every marker in the flattened transcript carries a per-request nonce keyed
+  by a per-process salt: the section tags, the role labels, and each
+  document's wrapper. Message content can neither close a section early nor
   forge a turn.
 - The ten variables a live Claude Code session exports to mark itself are
   stripped from the child's environment, by exact name. Among them are a
   messaging token and `CLAUDE_EFFORT`, which would silently change the effort
-  and cost of every turn. Variables that select the credential —
-  `CLAUDE_CONFIG_DIR`, `ANTHROPIC_API_KEY` — are deliberately left alone.
+  and cost of every turn. Variables that select the credential, such as
+  `CLAUDE_CONFIG_DIR` and `ANTHROPIC_API_KEY`, are left alone on purpose.
 
 [Unreleased]: https://github.com/cjohnhanson/rig-claude-code

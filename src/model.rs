@@ -25,17 +25,16 @@ use crate::{request, streaming};
 /// all of which are removed from the child's environment.
 ///
 /// `CLAUDECODE` alone is not enough. A session also exports a messaging socket
-/// and token, a session id, an entrypoint, and `CLAUDE_EFFORT` — which would
-/// silently change the effort level of every turn depending on who launched
-/// the host process, and with it both the cost and the reproducibility of the
-/// invocation.
+/// and token, a session id, an entrypoint, and `CLAUDE_EFFORT`. That last one
+/// would change the effort level of every turn according to who launched the
+/// host process, and with it the cost and reproducibility of the invocation.
 ///
 /// These are matched by exact name, not by prefix. A `CLAUDE_` prefix would
 /// also strip `CLAUDE_CONFIG_DIR`, which names the `.claude` directory the CLI
-/// reads and so selects *which account's credential* pays for the turn — the
-/// standard way to keep several logins on one machine — and
-/// `CLAUDE_CODE_USE_BEDROCK` / `CLAUDE_CODE_USE_VERTEX`, which route the turn to
-/// a different backend. Those are the caller's to control, exactly as
+/// reads, and so selects which account's credential pays for the turn. It is
+/// the standard way to keep several logins on one machine. A prefix would also
+/// strip `CLAUDE_CODE_USE_BEDROCK` and `CLAUDE_CODE_USE_VERTEX`, which route
+/// the turn to a different backend. Those are the caller's to control, exactly as
 /// `ANTHROPIC_API_KEY` is; removing them would silently switch accounts.
 const SESSION_MARKERS: &[&str] = &[
     "CLAUDECODE",
@@ -144,8 +143,8 @@ fn timed_out(program: &str, timeout: Duration) -> CompletionError {
 /// The child's stderr goes into a [`ProviderResponseError`] body, never into a
 /// `ProviderError` message. rig's stream driver treats any `ProviderError`
 /// whose text contains `aborted` as a cancellation and ends the stream
-/// cleanly, with no error item — and Node's own `AbortError` message is
-/// literally "This operation was aborted". Quoting untrusted stderr inside a
+/// cleanly, with no error item. Node's own `AbortError` message is
+/// "This operation was aborted". Quoting untrusted stderr inside a
 /// `ProviderError` would let the CLI's most common failure text turn a failed
 /// streaming turn into an empty success. `ProviderResponse` is not sniffed,
 /// and it hands the caller the text as data.
@@ -177,9 +176,9 @@ impl Drop for AbortOnDrop {
 /// The bytes accumulate in a shared buffer rather than in the task's return
 /// value, so a caller that stops waiting can still read what arrived. That
 /// matters because a pipe reaches end-of-file only when *every* write end
-/// closes, including a grandchild that inherited it — an MCP server, an
-/// uploader, a telemetry flush — and waiting for that would hold the turn
-/// open for the grandchild's whole lifetime.
+/// closes, including a grandchild that inherited it: an MCP server, an
+/// uploader, a telemetry flush. Waiting for that would hold the turn open for
+/// the grandchild's whole lifetime.
 struct Drain {
     task: AbortOnDrop,
     buffer: Arc<Mutex<Vec<u8>>>,
@@ -310,7 +309,7 @@ impl ClaudeCodeModel {
     /// Pass additional arguments to the CLI.
     ///
     /// This is the escape hatch for CLI capabilities this crate does not model
-    /// — `--add-dir`, `--max-budget-usd`, `--fallback-model`, and so on. The
+    /// such as `--add-dir`, `--max-budget-usd`, and `--fallback-model`. The
     /// arguments are appended after the ones the crate sets.
     ///
     /// An argument that collides with a flag the crate owns is rejected when
@@ -553,10 +552,10 @@ impl CompletionModel for ClaudeCodeModel {
     ///
     /// Returns [`CompletionError::RequestError`] for a request the CLI cannot
     /// express, and [`CompletionError::ProviderError`] when the process cannot
-    /// be started. Failures that only become visible mid-stream — a non-zero
-    /// exit, a failed turn, a stream that ends without its terminal frame, a
-    /// turn that outruns the timeout — surface as an error item within the
-    /// stream.
+    /// be started. A failure that becomes visible mid-stream surfaces as an
+    /// error item within the stream: a non-zero exit, a failed turn, a stream
+    /// that ends without its terminal frame, or a turn that outruns the
+    /// timeout.
     async fn stream(
         &self,
         request: CompletionRequest,
@@ -581,13 +580,13 @@ impl CompletionModel for ClaudeCodeModel {
             let mut lines = streaming::Lines::new(stdout);
             let mut saw_terminal_frame = false;
             // The child's exit is the other way this loop can end. Waiting for
-            // end-of-file alone tracks whatever still holds the pipe open — an
-            // MCP server, a telemetry flush — so a CLI that dies without its
-            // terminal frame would never surface the failure.
+            // end-of-file alone tracks whatever still holds the pipe open, such
+            // as an MCP server or a telemetry flush. A CLI that dies without
+            // its terminal frame would then never surface the failure.
             let mut exit: Option<std::io::Result<std::process::ExitStatus>> = None;
             let mut after_exit: Option<tokio::time::Instant> = None;
             // `Instant + Duration` panics on overflow, so `with_timeout(Duration::MAX)`
-            // — a plausible way to spell "effectively none" — would panic here.
+            // would panic here. That is a plausible way to spell "no timeout".
             // A deadline that cannot be represented is no deadline, which is
             // what the caller meant and what the blocking path already does.
             let deadline = timeout.and_then(|limit| tokio::time::Instant::now().checked_add(limit));
@@ -732,8 +731,8 @@ fn settle(
 ///
 /// The grace periods sit inside the deadline too. Otherwise a turn whose child
 /// exited on time could still overrun the stated bound by however long a
-/// grandchild keeps the pipes open, up to the grace — and the README promises
-/// the bound covers the whole turn. Whatever stderr arrived is returned either
+/// grandchild keeps the pipes open, up to the grace. The README promises the
+/// bound covers the whole turn. Whatever stderr arrived is returned either
 /// way; a deadline that cuts the drain short costs at most the tail of an
 /// error message.
 async fn drain_within(
