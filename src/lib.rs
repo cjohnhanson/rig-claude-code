@@ -33,8 +33,9 @@
 //!
 //! Preambles and system messages, context documents, multi-turn history,
 //! token accounting, streaming with token-level text and reasoning deltas,
-//! and native structured output through the CLI's `--json-schema` on the
-//! blocking path. rig features that need nothing from a provider, such as
+//! and native structured output through the CLI's `--json-schema` for
+//! `prompt` and `prompt_typed`, though not for `stream_prompt`. rig features
+//! that need nothing from a provider, such as
 //! conversation memory and agent hooks, work unchanged. Those are rig's hooks;
 //! the crate does not load the CLI's own hooks.
 //!
@@ -73,8 +74,8 @@
 //! whole envelope as the body. Branch on the envelope's `subtype` through
 //! `provider_response_json`, not on message text.
 //!
-//! The README covers configuration, the trust model, and the reasons behind
-//! the invocation.
+//! The README covers configuration, the trust model, and why the invocation
+//! is shaped as it is.
 
 #![forbid(unsafe_code)]
 

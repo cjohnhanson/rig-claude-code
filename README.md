@@ -79,7 +79,7 @@ Check it before you rely on it.
 
 `from_env` runs `claude --version` on the calling thread to confirm the binary
 works. Call it during setup. `ClaudeCodeClient::new` followed by
-`version().await` does the same check without blocking. Neither call confirms
+`version().await` does the same check without holding the thread. Neither call confirms
 the CLI is logged in. Only a real turn confirms that; a logged-out CLI fails
 the first turn with a refusal envelope (see [Handle a failed
 turn](#handle-a-failed-turn)).
@@ -157,13 +157,14 @@ while let Some(item) = stream.next().await {
 ```
 
 This example needs the `futures` crate. `examples/shipping_forecast.rs` runs
-the blocking, multi-turn, and streaming paths against a real binary.
+`prompt`, `chat`, and `stream_prompt` against a real binary.
 
 ## Get structured output
 
-Structured output works on the blocking path. Set no mode; the default
-`OutputMode::Auto` resolves to native structured output because the transport
-carries no tools.
+Structured output works through `prompt` and `prompt_typed`, which return
+the whole answer at once. It does not work through `stream_prompt`; see the
+end of this section. Set no output mode: the default `OutputMode::Auto`
+resolves to native structured output because the transport carries no tools.
 
 ```rust,no_run
 use rig::completion::TypedPrompt;
@@ -212,9 +213,9 @@ let agent = client.agent(models::SONNET).build();
 # }
 ```
 
-A non-interactive `claude -p` run calls only tools on its allow-list. The
-tools stay under the CLI's control: rig does not see them, does not observe
-their calls, and a rig tool registered on the agent is still refused.
+A non-interactive `claude -p` run calls only tools on its allow-list. MCP
+tools stay under the CLI's control. rig never sees them or their calls, and
+the crate still refuses a rig tool registered on the agent.
 
 ## Handle a failed turn
 
@@ -264,31 +265,31 @@ unsupported request setting with an error. It never drops one silently.
 | A last message with no text | The CLI needs a prompt. A transcript with nothing after it is answered as if it were the question. |
 | An output schema over 96 KiB | The schema is passed as one argument, and Linux caps an argument at 128 KiB. |
 
-**Message content is text.** The crate replaces an image, audio, video,
-document block, or tool result with a visible placeholder such as `[an image
-was omitted: this transport sends text only]`. The model is told what was
-left out.
+Message content is text. The crate replaces an image, audio, video, document
+block, or tool result with a visible placeholder such as `[an image was
+omitted: this transport sends text only]`, so the model is told what was left
+out.
 
-**History is flattened, not replayed.** The CLI takes one prompt, so the crate
-renders prior turns into it as a labelled transcript. Every marker in the
-transcript carries a per-request nonce, so message text cannot forge a turn
-or close a section early. Two consequences follow. A `Message::System`
-anywhere in the history moves into the system prompt. A trailing
-`Message::System` is sent as the system prompt and as the prompt.
+The CLI takes one prompt, so the crate renders prior turns into it as a
+labelled transcript rather than replaying them. Every marker in the transcript
+carries a per-request nonce, and message text therefore cannot forge a turn or
+close a section early. A `Message::System` anywhere in the history moves into
+the system prompt. A trailing `Message::System` is sent both as the system
+prompt and as the prompt.
 
-**Each turn is a fresh process.** The `session_id` the CLI reports appears as
-rig's `message_id`, for observability only. Feeding it back resumes nothing.
+Each turn is a fresh process. The `session_id` the CLI reports appears as
+rig's `message_id` for observability only; feeding it back resumes nothing.
 
-**Output is bounded.** A blocking turn keeps at most 16 MiB of output and
-reports an overflow as a size limit. A streaming turn has no total cap; one
-frame over 16 MiB with no newline fails the stream with a read error.
+A `prompt` turn keeps at most 16 MiB of output and reports an overflow as a
+size limit. A `stream_prompt` turn has no total cap, but one frame over 16 MiB
+with no newline fails the stream with a read error.
 
-**The child is killed on drop.** Dropping the future or stream that drives a
-turn kills the child, so an abandoned turn does not keep spending usage. The
-kill reaches the child, not its descendants; an MCP server the CLI started can
-outlive the turn. Concurrent turns are concurrent processes.
+Dropping the future or stream that drives a turn kills the child, so an
+abandoned turn does not keep spending usage. The kill reaches the child and
+not its descendants; an MCP server the CLI started can outlive the turn.
+Concurrent turns are concurrent processes.
 
-**Unix only.** Windows is untested and not covered by CI.
+The crate is tested on Unix. Windows is untested and not covered by CI.
 
 ## Reference: environment and trust
 
@@ -318,16 +319,18 @@ the credential or the endpoint, and the crate leaves them alone on purpose:
 
 ## Explanation: why the invocation looks the way it does
 
-**The flags.** A plain `claude -p` loads the full Claude Code agent system
-prompt, the project's `CLAUDE.md`, configured MCP servers, and skills. Against
-Claude Code 2.1.233, a one-word prompt cost about 42,000 input tokens that
-way. The crate passes `--tools ""`, `--strict-mcp-config`,
-`--setting-sources ""`, and `--disable-slash-commands`. The same prompt then
-costs about 165 tokens. `--bare` is not in that list because it forces
-authentication through `ANTHROPIC_API_KEY` and never reads the subscription
-credential.
+### Why these flags
 
-**The prompt is on standard input, and the system prompt is in a file.**
+A plain `claude -p` loads the full Claude Code agent system prompt, the
+project's `CLAUDE.md`, configured MCP servers, and skills. Against Claude Code
+2.1.233, a one-word prompt cost about 42,000 input tokens that way. The crate
+passes `--tools ""`, `--strict-mcp-config`, `--setting-sources ""`, and
+`--disable-slash-commands`, and the same prompt then costs about 165 tokens.
+`--bare` is not in that list. It forces authentication through
+`ANTHROPIC_API_KEY` and never reads the subscription credential.
+
+### Why the prompt is on standard input and the system prompt is in a file
+
 Neither is passed as an argument, for three reasons, each verified against
 2.1.233.
 
@@ -338,8 +341,8 @@ Neither is passed as an argument, for three reasons, each verified against
    before its own option parsing, so the payload fires from an option value
    too, and an end-of-options `--` does not stop it.
 2. Length. Linux caps one argument at 128 KiB. A flattened transcript exceeds
-   that and fails with `E2BIG`, which reads like a missing binary. macOS
-   allows more, so the failure appears only on Linux.
+   that and fails with `E2BIG`, an error that resembles a missing binary.
+   macOS allows more, so the failure appears only on Linux.
 3. Exposure. Arguments are readable through `/proc` and `ps`. For a RAG
    agent, that would expose every retrieved document.
 
@@ -348,15 +351,18 @@ The system prompt file is created with mode 0600 and passed as
 it appears only inside the description of `--bare`. It works, and the crate
 depends on it.
 
-**The schema loses its `$schema` key.** schemars stamps every schema with a
-pointer to the 2020-12 metaschema. The CLI's validator cannot resolve that URI
-and rejects the schema. The crate removes that one key and nothing else.
+### Why the schema loses its `$schema` key
 
-**Envelope before exit status.** The CLI reports a usage limit, a rate limit,
-or an unrecognized model as an envelope on standard output together with exit
-code 1, and its standard error is often empty. The crate reads the envelope
-first so the explanation is never lost. A successful envelope beside a failed
-exit is still a failure.
+schemars stamps every schema with a pointer to the 2020-12 metaschema. The
+CLI's validator cannot resolve that URI and rejects the schema. The crate
+removes that one key and nothing else.
+
+### Why the envelope is read before the exit status
+
+The CLI reports a usage limit, a rate limit, or an unrecognized model as an
+envelope on standard output together with exit code 1, and its standard error
+is often empty. The crate reads the envelope first so the explanation is never
+lost. A successful envelope beside a failed exit is still a failure.
 
 ## Test
 
@@ -370,9 +376,9 @@ The integration suite drives a scripted stand-in for the `claude` binary. It
 asserts on the real spawned argument vector, on what crossed standard input,
 on the child's environment, on exit-status handling, and on process lifetime.
 The stand-in reproduces shapes a naive double cannot: output that arrives in
-stages, a flood of standard error before the frames, a grandchild that holds
-the pipes open after the child exits, and a child abandoned mid-turn. Those
-tests are Unix-only because the stand-in is a shell script.
+stages, a flood of standard error before any frames, a grandchild that holds
+pipes open after the child exits, and a child abandoned mid-turn. Those tests
+are Unix-only because the stand-in is a shell script.
 
 `cargo run --example shipping_forecast` and `cargo run --example
 typed_output` run against a real binary and spend usage.

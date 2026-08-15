@@ -22,13 +22,15 @@ The public surface, in full:
   `claude --version`.
 - `ClientError`, `UnsupportedSetting`, `CliResponse`, `CliUsage`,
   `OutputTokenDetails`, the `models` module, `BINARY_ENV`, `DEFAULT_BINARY`.
-- Blocking completion and streaming. Streaming reads the CLI's newline-
-  delimited JSON frames and emits token-level text and reasoning deltas.
-- Native structured output through the CLI's `--json-schema`, on the blocking
-  path. schemars 1.x's `$schema` pointer to the 2020-12 metaschema is stripped
-  first: Claude Code 2.1.233 cannot resolve it and rejects the schema outright,
-  so without that every `prompt_typed` turn failed. A streamed turn yields the
-  model's pre-enforcement prose; the enforced JSON is in the terminal frame.
+- Whole-answer completion through `prompt`, and streaming through
+  `stream_prompt`. Streaming reads the CLI's newline-delimited JSON frames
+  and emits token-level text and reasoning deltas.
+- Native structured output through the CLI's `--json-schema`, for `prompt`
+  and `prompt_typed`. schemars 1.x's `$schema` pointer to the 2020-12
+  metaschema is stripped first: Claude Code 2.1.233 cannot resolve it and
+  rejects the schema outright, so without that every `prompt_typed` turn
+  failed. A streamed turn yields the model's pre-enforcement prose; the
+  enforced JSON is in the terminal frame.
 - `UnsupportedSetting`: a public, downcastable cause for every request setting
   the transport cannot express: tool definitions, `temperature`, `max_tokens`,
   `additional_params`, any `tool_choice` other than `None`, a last message with
@@ -58,10 +60,10 @@ The public surface, in full:
 - The child is killed when the future or stream driving it is dropped, so an
   abandoned turn does not leave a `claude` running and spending the login's
   usage.
-- Error messages quote a bounded prefix of the child's output. A blocking
+- Error messages quote a bounded prefix of the child's output. A `prompt`
   turn's pipes are read with a byte cap and an overflow is reported as a size
-  limit rather than a parse failure; a streaming turn caps each frame at 16 MiB
-  and fails the stream past that.
+  limit rather than a parse failure; a `stream_prompt` turn caps each frame at
+  16 MiB and fails the stream past that.
 - A child that fails is reported as `CompletionError::ProviderResponse`, with
   its stderr as the body, never as `ProviderError`. rig's stream driver treats
   any `ProviderError` whose text contains "aborted" as a cancellation and ends
