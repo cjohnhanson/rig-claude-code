@@ -102,6 +102,19 @@ fn timed_out(program: &str, timeout: Duration) -> CompletionError {
     ))
 }
 
+/// A task that is cancelled when this guard is dropped.
+///
+/// Dropping a bare [`JoinHandle`] detaches its task rather than cancelling it,
+/// so a cancelled turn would leave the feeder blocked in `write_all` and the
+/// drains blocked in `read` for as long as anything held the pipes open.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// A running drain of one of the child's pipes.
 ///
 /// The bytes accumulate in a shared buffer rather than in the task's return
@@ -111,7 +124,7 @@ fn timed_out(program: &str, timeout: Duration) -> CompletionError {
 /// uploader, a telemetry flush — and waiting for that would hold the turn
 /// open for the grandchild's whole lifetime.
 struct Drain {
-    task: JoinHandle<()>,
+    task: AbortOnDrop,
     buffer: Arc<Mutex<Vec<u8>>>,
 }
 
@@ -143,7 +156,18 @@ impl Drain {
                 }
             }
         });
-        Self { task, buffer }
+        Self {
+            task: AbortOnDrop(task),
+            buffer,
+        }
+    }
+
+    /// Everything read so far, without waiting for the pipe to close.
+    fn snapshot(&self) -> Vec<u8> {
+        self.buffer
+            .lock()
+            .map(|bytes| bytes.clone())
+            .unwrap_or_default()
     }
 
     /// Wait up to `grace` for the pipe to close, then take what there is.
@@ -152,11 +176,11 @@ impl Drain {
     /// grandchild is not a reason to discard the bytes already read.
     async fn finish(self, grace: Duration) -> Vec<u8> {
         let Self { mut task, buffer } = self;
-        let _ = tokio::time::timeout(grace, &mut task).await;
-        // The task is abandoned rather than joined when the grace elapses;
-        // aborting it here would be a race against the bytes still in flight,
-        // and the buffer is already shared.
-        task.abort();
+        let _ = tokio::time::timeout(grace, &mut task.0).await;
+        // Dropping `task` aborts it, which is right either way: the read is
+        // either finished or being abandoned, and the bytes are in the shared
+        // buffer regardless.
+        drop(task);
         buffer.lock().map(|bytes| bytes.clone()).unwrap_or_default()
     }
 }
@@ -306,7 +330,7 @@ impl ClaudeCodeModel {
     fn spawn_child(
         &self,
         spec: &CommandSpec,
-    ) -> Result<(Child, JoinHandle<()>, Option<tempfile::NamedTempFile>), CompletionError> {
+    ) -> Result<(Child, AbortOnDrop, Option<tempfile::NamedTempFile>), CompletionError> {
         self.check_extra_args()?;
 
         // The system prompt goes in a private file rather than argv: the CLI
@@ -351,7 +375,7 @@ impl ClaudeCodeModel {
             let _ = stdin.shutdown().await;
         });
 
-        Ok((child, feed, system_file))
+        Ok((child, AbortOnDrop(feed), system_file))
     }
 }
 
@@ -376,25 +400,29 @@ impl CompletionModel for ClaudeCodeModel {
         let stderr_drain = Drain::start(stderr, STDERR_LIMIT);
         let stdout_drain = Drain::start(stdout, STDOUT_LIMIT);
 
-        let turn = async {
-            let status = child.wait().await;
-            let stdout_bytes = stdout_drain.finish(STDOUT_GRACE).await;
-            (status, stdout_bytes)
-        };
-
-        let (status, stdout_bytes) = match self.timeout {
+        // Only the child is on the caller's clock. Charging the drain's grace
+        // period to it would fail a turn whose answer is already buffered.
+        let status = match self.timeout {
             // Dropping `child` on the timeout path kills it, because the spawn
             // set `kill_on_drop`.
-            Some(limit) => tokio::time::timeout(limit, turn)
+            Some(limit) => tokio::time::timeout(limit, child.wait())
                 .await
                 .map_err(|_| timed_out(&self.binary, limit))?,
-            None => turn.await,
+            None => child.wait().await,
         };
-        feed.abort();
+        drop(feed);
 
         let status = status.map_err(|error| {
             CompletionError::ProviderError(format!("waiting for `{}`: {error}", self.binary))
         })?;
+
+        // The envelope is usually complete the moment the child exits. Taking
+        // it here avoids waiting out the grace period when a grandchild is
+        // holding the pipe open, which is the whole reason the grace exists.
+        if let Some(envelope) = response::find_envelope(&stdout_drain.snapshot()) {
+            return envelope.into_completion_response();
+        }
+        let stdout_bytes = stdout_drain.finish(STDOUT_GRACE).await;
 
         // The envelope comes first, whatever the exit status. The CLI reports
         // a usage limit, a rate limit, or an unrecognized model as a
@@ -455,6 +483,7 @@ impl CompletionModel for ClaudeCodeModel {
             // cancelled before the prompt is written.
             let _system_file = system_file;
             let _feed = feed;
+            let mut stopped_early = false;
 
             let mut lines = streaming::Lines::new(stdout);
             let mut saw_terminal_frame = false;
@@ -492,6 +521,7 @@ impl CompletionModel for ClaudeCodeModel {
                         // running, and a second terminal frame would tear the
                         // result: usage from the first, identity from the
                         // second.
+                        stopped_early = true;
                         break;
                     }
                     streaming::Event::Fail(error) => {
@@ -502,7 +532,27 @@ impl CompletionModel for ClaudeCodeModel {
                 }
             }
 
-            let status = child.wait().await;
+            // Stopping the line reader must not stop the pipe being read: a
+            // child with more than a pipe-buffer of trailing output blocks in
+            // `write` forever, and `child.wait()` never returns.
+            let tail = stopped_early.then(|| Drain::start(lines.into_reader(), 0));
+
+            // The deadline covers the tail too. It used to stop applying once
+            // the loop broke, so a child that emitted its result and then took
+            // its time exiting held the caller past the stated limit and then
+            // reported success.
+            let waited = match deadline {
+                Some(at) => tokio::time::timeout_at(at, child.wait()).await.ok(),
+                None => Some(child.wait().await),
+            };
+            let Some(status) = waited else {
+                // Returning drops `child`, which kills it.
+                yield Err(timed_out(&program, timeout.unwrap_or_default()));
+                return;
+            };
+            if let Some(tail) = tail {
+                let _ = tail.finish(STDERR_GRACE).await;
+            }
             let stderr_text = stderr_drain.finish(STDERR_GRACE).await;
 
             match status {

@@ -44,6 +44,16 @@ pub(crate) struct Lines<R> {
 }
 
 impl<R: AsyncRead + Unpin> Lines<R> {
+    /// Give the reader back, so the caller can keep the pipe drained after it
+    /// stops splitting lines.
+    ///
+    /// Anything already buffered but not yet returned as a line is discarded:
+    /// the caller is done reading frames, and the point of taking the reader
+    /// back is to stop the pipe filling.
+    pub(crate) fn into_reader(self) -> R {
+        self.reader
+    }
+
     /// Wrap a reader.
     pub(crate) fn new(reader: R) -> Self {
         Self {
@@ -327,6 +337,24 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].len(), big.len());
         assert_eq!(lines[1], "after");
+    }
+
+    #[tokio::test]
+    async fn splits_a_very_large_frame_in_bounded_time() {
+        // The `searched` offset is what makes this linear. Without it the scan
+        // restarts at the front after every read: one 16 MiB frame arriving in
+        // 8 KiB reads rescans about 16 GiB, measured at 44 seconds.
+        let big = "x".repeat(MAX_FRAME_BYTES - 1);
+        let input = format!("{big}\n");
+        let started = std::time::Instant::now();
+        let lines = collect_lines(input.as_bytes()).await.unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].len(), big.len());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}; the newline scan is quadratic again",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

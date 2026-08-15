@@ -254,7 +254,28 @@ pub(crate) fn find_envelope(stdout: &[u8]) -> Option<CliResponse> {
     text.lines()
         .rev()
         .filter(|line| !line.trim().is_empty())
-        .find_map(|line| serde_json::from_str::<CliResponse>(line.trim()).ok())
+        .find_map(|line| envelope_line(line.trim()))
+}
+
+/// Parse one line, but only if it looks like the result envelope.
+///
+/// Every field of [`CliResponse`] is defaulted and unknown fields are kept, so
+/// *any* JSON object deserializes into one. Without a discriminator, the scan
+/// that exists to survive a warning line printed **before** the envelope turns
+/// a diagnostic printed **after** it into a lost turn. The streaming
+/// classifier requires `"type":"result"`; this requires the same, or, for the
+/// blocking envelope which carries no `type`, at least one field only a real
+/// envelope has.
+fn envelope_line(line: &str) -> Option<CliResponse> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let object = value.as_object()?;
+    let looks_like_a_result = match object.get("type").and_then(serde_json::Value::as_str) {
+        Some(kind) => kind == "result",
+        None => ["result", "subtype", "session_id", "is_error"]
+            .iter()
+            .any(|field| object.contains_key(*field)),
+    };
+    looks_like_a_result.then(|| serde_json::from_value(value).ok())?
 }
 
 /// Deserialize the CLI's stdout into an envelope.
@@ -387,6 +408,27 @@ mod tests {
     fn finds_the_last_envelope_when_lines_follow_it() {
         let stdout = b"{\"result\":\"first\"}\n{\"result\":\"second\"}\n";
         assert_eq!(parse(stdout).unwrap().result.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn ignores_a_json_diagnostic_printed_after_the_envelope() {
+        // Every field is defaulted and unknown fields are kept, so any JSON
+        // object deserializes into an envelope. Without a discriminator this
+        // telemetry line wins the backwards scan and the answer is lost.
+        let stdout = b"{\"result\":\"the answer\"}\n{\"type\":\"telemetry\",\"flushed\":true}\n";
+        assert_eq!(parse(stdout).unwrap().result.as_deref(), Some("the answer"));
+    }
+
+    #[test]
+    fn ignores_a_plain_json_object_printed_after_the_envelope() {
+        let stdout = b"{\"result\":\"the answer\"}\n{\"flushed\":true}\n";
+        assert_eq!(parse(stdout).unwrap().result.as_deref(), Some("the answer"));
+    }
+
+    #[test]
+    fn accepts_a_typed_result_line() {
+        let stdout = b"noise\n{\"type\":\"result\",\"result\":\"ok\"}\n";
+        assert_eq!(parse(stdout).unwrap().result.as_deref(), Some("ok"));
     }
 
     #[test]

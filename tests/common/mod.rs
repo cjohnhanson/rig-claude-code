@@ -35,7 +35,16 @@ pub struct FakeClaudeBuilder {
     exit_code: i32,
     delay_before: Option<f32>,
     delay_mid: Option<f32>,
+    delay_after: Option<f32>,
     stderr_first: bool,
+    /// Bytes written to stdout before standard input is read at all.
+    stdout_before_stdin: Option<usize>,
+    /// Ignore `SIGPIPE`, so a closed read end does not end the child.
+    ignore_sigpipe: bool,
+    /// Seconds to wait before reading the system-prompt file.
+    system_prompt_delay: Option<f32>,
+    /// Emit this stdout fixture forever, pausing between repeats.
+    repeat_forever: Option<f32>,
     orphan_seconds: Option<f32>,
     sentinel_after: Option<f32>,
 }
@@ -59,7 +68,12 @@ impl FakeClaude {
             exit_code: 0,
             delay_before: None,
             delay_mid: None,
+            delay_after: None,
             stderr_first: false,
+            stdout_before_stdin: None,
+            ignore_sigpipe: false,
+            system_prompt_delay: None,
+            repeat_forever: None,
             orphan_seconds: None,
             sentinel_after: None,
         }
@@ -149,6 +163,15 @@ impl FakeClaude {
             == "present"
     }
 
+    /// Whether any of the child's writes to a pipe failed.
+    ///
+    /// A reader that stops reading once it has kept enough bytes drops its end
+    /// of the pipe, and the child then takes `EPIPE` part-way through its
+    /// output rather than running to completion.
+    pub fn write_failed(&self) -> bool {
+        self.read("write_failed").is_some()
+    }
+
     /// Whether the child's delayed sentinel has appeared.
     pub fn sentinel_exists(&self) -> bool {
         self.dir.path().join("sentinel").exists()
@@ -193,6 +216,47 @@ impl FakeClaudeBuilder {
     #[must_use]
     pub fn delay_mid(mut self, delay: Duration) -> Self {
         self.delay_mid = Some(delay.as_secs_f32());
+        self
+    }
+
+    /// Linger after writing everything, before exiting.
+    #[must_use]
+    pub fn delay_after(mut self, delay: Duration) -> Self {
+        self.delay_after = Some(delay.as_secs_f32());
+        self
+    }
+
+    /// Write `bytes` to standard output before reading standard input.
+    ///
+    /// This is the shape that deadlocks a parent which writes the whole prompt
+    /// before draining the child's output: each blocks on the other's pipe.
+    #[must_use]
+    pub fn stdout_before_stdin(mut self, bytes: usize) -> Self {
+        self.stdout_before_stdin = Some(bytes);
+        self
+    }
+
+    /// Ignore `SIGPIPE`.
+    ///
+    /// Without this a child dies on its own when the parent drops the read
+    /// end, which makes a missing kill look like a working one.
+    #[must_use]
+    pub fn ignore_sigpipe(mut self) -> Self {
+        self.ignore_sigpipe = true;
+        self
+    }
+
+    /// Wait before reading the file named by `--system-prompt-file`.
+    #[must_use]
+    pub fn system_prompt_delay(mut self, delay: Duration) -> Self {
+        self.system_prompt_delay = Some(delay.as_secs_f32());
+        self
+    }
+
+    /// Repeat the stdout fixture forever, pausing `interval` between repeats.
+    #[must_use]
+    pub fn repeat_forever(mut self, interval: Duration) -> Self {
+        self.repeat_forever = Some(interval.as_secs_f32());
         self
     }
 
@@ -255,39 +319,71 @@ impl FakeClaudeBuilder {
             .map(|seconds| format!("( sleep {seconds} ) &\n"))
             .unwrap_or_default();
 
+        let sleep_after = self
+            .delay_after
+            .map(|seconds| format!("sleep {seconds}\n"))
+            .unwrap_or_default();
+
         let sentinel = self
             .sentinel_after
             .map(|seconds| format!("sleep {seconds}\ntouch \"$here/sentinel\"\n"))
             .unwrap_or_default();
 
-        let (first, second) = if self.stderr_first {
-            ("cat \"$here/stderr\" >&2\n".to_owned(), emit_stdout)
-        } else {
-            (emit_stdout, "cat \"$here/stderr\" >&2\n".to_owned())
+        // `||` records a failed write: a reader that stops early drops its end
+        // and the child takes EPIPE part-way through.
+        let emit_stderr =
+            "cat \"$here/stderr\" >&2 || echo failed > \"$here/write_failed\"\n".to_owned();
+        let emit_stdout = match self.repeat_forever {
+            Some(interval) => format!("while :; do {emit_stdout}sleep {interval}; done\n"),
+            None => emit_stdout,
         };
+
+        let (first, second) = if self.stderr_first {
+            (emit_stderr, emit_stdout)
+        } else {
+            (emit_stdout, emit_stderr)
+        };
+
+        let pre_stdin = self
+            .stdout_before_stdin
+            // Newline-terminated, so the padding is a noise *line* rather than
+            // a prefix glued to the envelope that follows it.
+            .map(|bytes| format!("head -c {bytes} /dev/zero | tr '\\0' 'p'; echo\n"))
+            .unwrap_or_default();
+
+        let trap = if self.ignore_sigpipe {
+            "trap '' PIPE\n"
+        } else {
+            ""
+        };
+
+        let system_prompt_wait = self
+            .system_prompt_delay
+            .map(|seconds| format!("sleep {seconds}\n"))
+            .unwrap_or_default();
 
         // `$0` is the script path, so the script finds its own fixtures
         // without an environment variable, which keeps parallel tests from
         // interfering with each other.
         let script = format!(
             r#"#!/bin/sh
-here=$(dirname "$0")
+{trap}here=$(dirname "$0")
 printf '%s\0' "$@" > "$here/argv"
-cat > "$here/stdin"
+{pre_stdin}cat > "$here/stdin"
 printf 'x' >> "$here/spawns"
 pwd > "$here/cwd"
 # Copy the system prompt while the child is alive: the caller deletes the
 # temporary file as soon as the turn ends.
 for a in "$@"; do
   if [ -n "$next_is_sp" ]; then
-    cp "$a" "$here/system_prompt" 2>/dev/null
+    {system_prompt_wait}cp "$a" "$here/system_prompt" 2>/dev/null
     {{ stat -f '%Lp' "$a" 2>/dev/null || stat -c '%a' "$a" 2>/dev/null; }} > "$here/system_prompt_mode"
     next_is_sp=
   fi
   if [ "$a" = "--system-prompt-file" ]; then next_is_sp=1; fi
 done
 if [ -n "${{CLAUDECODE+set}}" ]; then echo present > "$here/nested"; else echo absent > "$here/nested"; fi
-{orphan}{sleep_before}{first}{second}{sentinel}exit {code}
+{orphan}{sleep_before}{first}{second}{sleep_after}{sentinel}exit {code}
 "#,
             code = self.exit_code
         );

@@ -291,16 +291,23 @@ fn render_prompt(request: &CompletionRequest) -> String {
     out
 }
 
-/// A short marker suffix that message content cannot predict.
+/// A marker suffix that message content cannot predict.
 ///
-/// Derived from the rendered content with a non-cryptographic hash. The point
-/// is that a caller writing `</transcript>` into a message cannot guess the
-/// suffix, not that the value resists an attacker who can already read the
-/// prompt — by then the framing protects nothing anyway.
+/// Derived from the rendered content, but keyed by a salt drawn once per
+/// process. Content alone is not enough: an unseeded hash of caller-supplied
+/// text is a pure function the caller can evaluate offline, so an attacker who
+/// drives the history could search for a value whose marker matches one they
+/// embed, close the framing early, and forge `assistant:` turns. The salt
+/// makes the marker unpredictable outside this process while keeping it stable
+/// within it, so the blocking and streaming builds of one request still agree.
 fn nonce_for(request: &CompletionRequest, history: &[&Message]) -> String {
-    use std::hash::{DefaultHasher, Hash as _, Hasher as _};
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher as _, Hash as _, Hasher as _};
+    use std::sync::OnceLock;
 
-    let mut hasher = DefaultHasher::new();
+    static SALT: OnceLock<RandomState> = OnceLock::new();
+
+    let mut hasher = SALT.get_or_init(RandomState::new).build_hasher();
     for document in &request.documents {
         document.id.hash(&mut hasher);
         document.text.hash(&mut hasher);
@@ -308,14 +315,7 @@ fn nonce_for(request: &CompletionRequest, history: &[&Message]) -> String {
     for message in history {
         message_text(message).hash(&mut hasher);
     }
-    // Truncation is the point: the low 32 bits make a short marker, and the
-    // marker only has to be unguessable from message content.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "a short marker is the intent"
-    )]
-    let short = hasher.finish() as u32;
-    format!("{short:08x}")
+    format!("{:016x}", hasher.finish())
 }
 
 /// Render one prior turn as a labelled transcript line, or nothing for a
@@ -621,6 +621,32 @@ mod tests {
             1,
             "exactly one real closing tag: {stdin}"
         );
+    }
+
+    #[test]
+    fn the_nonce_is_stable_within_a_process_but_not_derived_from_content_alone() {
+        let mut req = request("ignored");
+        req.chat_history =
+            OneOrMany::many(vec![Message::user("first"), Message::user("second")]).unwrap();
+
+        let once = spec_for(&req).stdin;
+        let twice = spec_for(&req).stdin;
+        assert_eq!(
+            once, twice,
+            "the blocking and streaming builds of one request must agree"
+        );
+
+        // An unsalted hash of the content would be reproducible here from the
+        // same inputs, which is exactly what makes it forgeable offline.
+        let marker = once
+            .split('\n')
+            .next()
+            .unwrap_or_default()
+            .trim_start_matches("<transcript-")
+            .trim_end_matches('>')
+            .to_owned();
+        assert_eq!(marker.len(), 16, "{marker}");
+        assert!(marker.chars().all(|c| c.is_ascii_hexdigit()), "{marker}");
     }
 
     #[test]
@@ -937,9 +963,40 @@ mod tests {
             value_after(&blocking, "--json-schema"),
             value_after(&streaming, "--json-schema")
         );
-        for flag in LEAN_FLAGS {
-            assert!(blocking.args.contains(&(*flag).to_owned()), "{flag}");
-            assert!(streaming.args.contains(&(*flag).to_owned()), "{flag}");
-        }
+
+        // Comparing against `LEAN_FLAGS` would hold for any value of that
+        // constant, including one with an extra flag in it. Compare the two
+        // argument vectors to each other instead, with only the output-format
+        // section removed.
+        let without_format = |spec: &CommandSpec, mode: Mode| -> Vec<String> {
+            let flags: Vec<String> = mode.flags().iter().map(|f| (*f).to_owned()).collect();
+            spec.args
+                .iter()
+                .filter(|arg| !flags.contains(arg))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            without_format(&blocking, Mode::Blocking),
+            without_format(&streaming, Mode::Streaming)
+        );
+    }
+
+    #[test]
+    fn different_content_gets_a_different_nonce() {
+        let mut first = request("ignored");
+        first.chat_history =
+            OneOrMany::many(vec![Message::user("alpha"), Message::user("q")]).unwrap();
+        let mut second = request("ignored");
+        second.chat_history =
+            OneOrMany::many(vec![Message::user("beta"), Message::user("q")]).unwrap();
+
+        let marker =
+            |spec: &CommandSpec| spec.stdin.split('\n').next().unwrap_or_default().to_owned();
+        assert_ne!(
+            marker(&spec_for(&first)),
+            marker(&spec_for(&second)),
+            "one marker reused across requests is one an attacker can learn"
+        );
     }
 }

@@ -225,12 +225,213 @@ async fn a_child_that_floods_stderr_first_does_not_deadlock() {
         .build();
     let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
 
-    let response = tokio::time::timeout(Duration::from_secs(20), model.completion(request("hi")))
+    let response = tokio::time::timeout(Duration::from_secs(60), model.completion(request("hi")))
         .await
         .expect("a concurrent drain finishes; a sequential one hangs")
         .unwrap();
 
     assert_eq!(text_of(&response), "ok");
+}
+
+#[tokio::test]
+async fn a_child_that_writes_before_reading_the_prompt_does_not_deadlock() {
+    // Writing the whole prompt before draining the child's output is a
+    // deadlock once the prompt passes the pipe buffer: this end blocks in
+    // `write`, the child blocks writing to a stdout pipe nobody is reading.
+    // Carrying flattened transcripts is the reason the prompt moved to stdin,
+    // so this is exactly the payload the design exists for.
+    let huge = "x".repeat(400 * 1024);
+    let fake = FakeClaude::builder()
+        .stdout(&envelope("ok"))
+        .stdout_before_stdin(300 * 1024)
+        .build();
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let response = tokio::time::timeout(Duration::from_secs(60), model.completion(request(&huge)))
+        .await
+        .expect("a concurrent feed finishes; a synchronous one deadlocks")
+        .unwrap();
+
+    assert_eq!(text_of(&response), "ok");
+    assert_eq!(
+        fake.stdin().len(),
+        huge.len(),
+        "the child must receive every byte"
+    );
+}
+
+#[tokio::test]
+async fn a_blocking_turn_keeps_output_a_grandchild_delayed() {
+    // Stdout never reaches end-of-file while a grandchild holds it, so the
+    // grace period elapses. Discarding the buffer at that point turns a good
+    // turn into "unparseable claude output" — the answer was already read.
+    let fake = FakeClaude::builder()
+        .stdout(&envelope("the answer"))
+        .orphan_for(Duration::from_secs(20))
+        .build();
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let response = tokio::time::timeout(Duration::from_secs(60), model.completion(request("hi")))
+        .await
+        .expect("must not wait out the grandchild")
+        .unwrap();
+
+    assert_eq!(text_of(&response), "the answer");
+}
+
+#[tokio::test]
+async fn a_chatty_child_cannot_outlast_the_turn_timeout() {
+    // Both other timeout tests use a child that emits nothing, which a
+    // per-line deadline catches identically. Only a child that keeps
+    // producing distinguishes a whole-turn deadline from one that resets.
+    let delta = "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\".\"}}}\n";
+    let fake = FakeClaude::builder()
+        .stdout(delta)
+        .repeat_forever(Duration::from_millis(200))
+        .build();
+    let model = ClaudeCodeModel::new("haiku")
+        .with_binary(fake.path())
+        .with_timeout(Duration::from_secs(2));
+
+    let started = std::time::Instant::now();
+    let stream = model.stream(request("hi")).await.unwrap();
+    let (_, _, failure) = tokio::time::timeout(Duration::from_secs(60), drain(stream))
+        .await
+        .expect("the whole-turn deadline must fire");
+
+    let failure = failure.expect("a child that never stops must fail the turn");
+    assert!(failure.contains("did not finish within"), "{failure}");
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_child_writing_past_the_retention_budget_never_fails_a_write() {
+    // Reading must continue past the retained prefix and discard the surplus.
+    // Stopping at the limit drops the read end, and the child then takes
+    // EPIPE part-way through: it does not hang, it dies mid-output.
+    let flood = "e".repeat(2_500 * 1024);
+    let fake = FakeClaude::builder()
+        .stdout(&envelope("ok"))
+        .stderr(&flood)
+        .stderr_first()
+        .build();
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let response = tokio::time::timeout(Duration::from_secs(60), model.completion(request("hi")))
+        .await
+        .expect("the drain must keep the pipe empty")
+        .unwrap();
+
+    assert_eq!(text_of(&response), "ok");
+    assert!(
+        !fake.write_failed(),
+        "the child took EPIPE: the drain stopped reading"
+    );
+}
+
+#[tokio::test]
+async fn a_streaming_system_prompt_file_outlives_the_child_that_reads_it() {
+    // The temporary file is deleted when its binding drops. If that happened
+    // before the child opened it, the agent would run with no system prompt
+    // and no error at all.
+    let fake = FakeClaude::builder()
+        .stdout(&frame_stream("ok", ""))
+        .system_prompt_delay(Duration::from_secs(1))
+        .build();
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let mut req = request("hi");
+    req.preamble = Some("Be terse.".to_owned());
+    let stream = model.stream(req).await.unwrap();
+    let (text, _, failure) = drain(stream).await;
+
+    assert_eq!(failure, None);
+    assert_eq!(text, "ok");
+    assert_eq!(fake.system_prompt().as_deref(), Some("Be terse."));
+}
+
+#[tokio::test]
+async fn dropping_a_turn_kills_a_child_that_ignores_sigpipe() {
+    // A child that dies of SIGPIPE when the drains drop proves the pipes
+    // closed, not that the child was killed. This one ignores SIGPIPE, so
+    // only an actual kill stops it.
+    let fake = FakeClaude::builder()
+        .stdout(&envelope("ok"))
+        .ignore_sigpipe()
+        .sentinel_after(Duration::from_millis(900))
+        .build();
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let abandoned =
+        tokio::time::timeout(Duration::from_millis(100), model.completion(request("hi"))).await;
+    assert!(abandoned.is_err(), "the turn should still be running");
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        !fake.sentinel_exists(),
+        "the child outlived the dropped turn"
+    );
+}
+
+#[tokio::test]
+async fn the_argument_vector_is_exactly_what_the_crate_intends() {
+    // `contains` checks cannot see an *added* flag. Nothing else in the suite
+    // would notice `--permission-mode bypassPermissions` appearing in every
+    // invocation — the same class of quiet misconfiguration the crate refuses
+    // to accept from a caller.
+    let fake = FakeClaude::printing(&envelope("ok"));
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    model.completion(request("hi")).await.unwrap();
+
+    assert_eq!(
+        fake.argv(),
+        vec![
+            "-p",
+            "--output-format",
+            "json",
+            "--model",
+            "haiku",
+            "--tools",
+            "",
+            "--strict-mcp-config",
+            "--setting-sources",
+            "",
+            "--disable-slash-commands",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_streaming_argument_vector_is_exactly_what_the_crate_intends() {
+    let fake = FakeClaude::printing(&frame_stream("ok", ""));
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let stream = model.stream(request("hi")).await.unwrap();
+    drain(stream).await;
+
+    assert_eq!(
+        fake.argv(),
+        vec![
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--include-partial-messages",
+            "--verbose",
+            "--model",
+            "haiku",
+            "--tools",
+            "",
+            "--strict-mcp-config",
+            "--setting-sources",
+            "",
+            "--disable-slash-commands",
+        ]
+    );
 }
 
 #[tokio::test]
@@ -677,6 +878,132 @@ async fn a_stream_ignores_frames_after_the_terminal_one() {
 }
 
 #[tokio::test]
+async fn a_stream_finishes_when_the_child_keeps_writing_after_the_terminal_frame() {
+    // Stopping the line reader must not stop the pipe being read. A child with
+    // more than a pipe buffer of trailing output — 64 KiB on most systems —
+    // blocks in `write` forever, and `child.wait()` never returns, with no
+    // deadline covering that line.
+    let mut frames = frame_stream("ok", "");
+    frames.push_str(&"t".repeat(512 * 1024));
+    frames.push('\n');
+    let fake = FakeClaude::printing(&frames);
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let stream = model.stream(request("hi")).await.unwrap();
+    let (text, _, failure) = tokio::time::timeout(Duration::from_secs(60), drain(stream))
+        .await
+        .expect("trailing output must not wedge the turn");
+
+    assert_eq!(failure, None);
+    assert_eq!(text, "ok");
+}
+
+#[tokio::test]
+async fn a_stream_timeout_covers_a_child_lingering_after_the_terminal_frame() {
+    // The deadline used to stop applying once the loop broke, so a child that
+    // emitted its result and then took its time exiting held the caller well
+    // past the stated limit and then reported success.
+    let fake = FakeClaude::builder()
+        .stdout(&frame_stream("ok", ""))
+        .delay_after(Duration::from_secs(30))
+        .build();
+    let model = ClaudeCodeModel::new("haiku")
+        .with_binary(fake.path())
+        .with_timeout(Duration::from_millis(400));
+
+    let started = std::time::Instant::now();
+    let stream = model.stream(request("hi")).await.unwrap();
+    let (_, _, failure) = tokio::time::timeout(Duration::from_secs(60), drain(stream))
+        .await
+        .expect("the timeout must fire");
+
+    let failure = failure.expect("a lingering child must fail the turn, not pass it");
+    assert!(failure.contains("did not finish within"), "{failure}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_turn_does_not_wait_for_a_grandchild_holding_the_pipes() {
+    // The blocking path used to charge the drain's grace period to the
+    // caller's timeout, so a turn whose answer was already buffered either
+    // paid the full grace or failed outright.
+    let fake = FakeClaude::builder()
+        .stdout(&envelope("ok"))
+        .orphan_for(Duration::from_secs(20))
+        .build();
+    let model = ClaudeCodeModel::new("haiku")
+        .with_binary(fake.path())
+        .with_timeout(Duration::from_secs(2));
+
+    let started = std::time::Instant::now();
+    let response = model.completion(request("hi")).await.unwrap();
+
+    assert_eq!(text_of(&response), "ok");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "waited {:?} for a grandchild that lives 20s",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn cancelling_a_turn_leaves_no_task_behind() {
+    // Dropping a `JoinHandle` detaches its task rather than cancelling it, so
+    // the stdin feeder and both drains outlived a cancelled turn — blocked on
+    // pipes a grandchild still held open.
+    let huge = "x".repeat(8 * 1024 * 1024);
+    let fake = FakeClaude::builder()
+        .stdout(&envelope("ok"))
+        .orphan_for(Duration::from_secs(30))
+        .delay_after(Duration::from_secs(30))
+        .build();
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let metrics = tokio::runtime::Handle::current().metrics();
+    let before = metrics.num_alive_tasks();
+
+    let abandoned =
+        tokio::time::timeout(Duration::from_millis(200), model.completion(request(&huge))).await;
+    assert!(abandoned.is_err(), "the turn should still be running");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        metrics.num_alive_tasks(),
+        before,
+        "the feeder and drains must be cancelled with the turn"
+    );
+}
+
+#[tokio::test]
+async fn a_non_zero_exit_still_quotes_stderr_a_grandchild_delayed() {
+    // Stderr never reaches end-of-file while a grandchild holds it, so the
+    // grace elapses. Discarding what was read at that point throws away the
+    // only explanation the failure has.
+    let fake = FakeClaude::builder()
+        .stderr("it went wrong")
+        .exit_code(2)
+        .orphan_for(Duration::from_secs(20))
+        .build();
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let error = tokio::time::timeout(Duration::from_secs(60), model.completion(request("hi")))
+        .await
+        .expect("must not wait out the grandchild")
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("exited with"), "{error}");
+    assert!(
+        error.contains("it went wrong"),
+        "the partial read must survive the grace period: {error}"
+    );
+}
+
+#[tokio::test]
 async fn a_stream_surfaces_a_non_zero_exit_with_its_stderr() {
     let fake = FakeClaude::failing("session limit reached", 1);
     let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
@@ -728,7 +1055,7 @@ async fn a_stream_survives_a_child_that_floods_stderr_first() {
     let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
 
     let stream = model.stream(request("hi")).await.unwrap();
-    let (text, _, failure) = tokio::time::timeout(Duration::from_secs(20), drain(stream))
+    let (text, _, failure) = tokio::time::timeout(Duration::from_secs(60), drain(stream))
         .await
         .expect("a concurrent drain finishes; a sequential one hangs");
 
@@ -768,8 +1095,9 @@ async fn dropping_a_stream_kills_the_child() {
     // this way, so this is a supported operation, not a consumer mistake.
     let fake = FakeClaude::builder()
         .stdout(&frame_stream("a", "b"))
+        .ignore_sigpipe()
         .delay_mid(Duration::from_millis(200))
-        .sentinel_after(Duration::from_millis(700))
+        .sentinel_after(Duration::from_millis(900))
         .build();
     let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
 
@@ -777,7 +1105,7 @@ async fn dropping_a_stream_kills_the_child() {
     let _first = stream.next().await;
     drop(stream);
 
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(
         !fake.sentinel_exists(),
         "the child outlived the dropped stream"
@@ -788,7 +1116,9 @@ async fn dropping_a_stream_kills_the_child() {
 async fn a_stream_timeout_kills_a_slow_child() {
     let fake = FakeClaude::builder()
         .stdout(&frame_stream("a", "b"))
-        .delay_before(Duration::from_secs(30))
+        .ignore_sigpipe()
+        .delay_before(Duration::from_secs(1))
+        .sentinel_after(Duration::from_millis(100))
         .build();
     let model = ClaudeCodeModel::new("haiku")
         .with_binary(fake.path())
@@ -799,6 +1129,12 @@ async fn a_stream_timeout_kills_a_slow_child() {
 
     let failure = failure.expect("the timeout should surface");
     assert!(failure.contains("did not finish within"), "{failure}");
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        !fake.sentinel_exists(),
+        "the error says the child was killed; it was not"
+    );
 }
 
 // --- the agent runtime -----------------------------------------------------

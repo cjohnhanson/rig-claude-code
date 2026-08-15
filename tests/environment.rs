@@ -88,16 +88,30 @@ async fn from_env_resolves_the_binary_from_the_environment() {
 #[tokio::test]
 async fn from_env_falls_back_to_the_binary_name_on_path() {
     let _guard = ENV_LOCK.lock().await;
-    // The documented default, and the branch every user without the variable
-    // set takes. Whether a real `claude` is installed is not this test's
-    // business: either it resolves and the client names the default, or it
-    // does not and the error names the default.
-    let outcome = with_var(BINARY_ENV, None, ClaudeCodeClient::from_env);
+    // The branch every user without the variable set takes. Rather than depend
+    // on whether a real `claude` is installed, this empties `PATH` so the
+    // lookup must fail, and asserts the failure names the default binary —
+    // which is only true if the default is what was looked up.
+    let empty = tempfile::tempdir().unwrap();
+    let previous_path = std::env::var("PATH").unwrap_or_default();
 
-    match outcome {
-        Ok(client) => assert_eq!(client.binary(), DEFAULT_BINARY),
-        Err(error) => assert!(error.to_string().contains(DEFAULT_BINARY), "{error}"),
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::set_var("PATH", empty.path().display().to_string());
     }
+    let outcome = with_var(BINARY_ENV, None, ClaudeCodeClient::from_env);
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::set_var("PATH", previous_path);
+    }
+
+    let error = outcome
+        .expect_err("an empty PATH cannot resolve any binary")
+        .to_string();
+    assert!(
+        error.contains(&format!("`{DEFAULT_BINARY}`")),
+        "the error must name the binary that was looked up: {error}"
+    );
 }
 
 #[tokio::test]
