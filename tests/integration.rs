@@ -11,7 +11,12 @@
 //! concurrent `spawn` in the same process, and every test here spawns.
 
 #![cfg(unix)]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 mod common;
 
@@ -1475,6 +1480,153 @@ async fn a_tool_call_from_the_cli_comes_back_as_a_rig_tool_call() {
         fake.value_after("--allowedTools").as_deref(),
         Some("mcp__rig__add")
     );
+}
+
+#[tokio::test]
+async fn a_streamed_turn_surfaces_the_calls_the_cli_made() {
+    // The streaming path started the bridge and never read its calls, so a
+    // streamed turn with tools advertised them, let the CLI call them, and
+    // dropped the calls on the floor.
+    let fake = FakeClaude::builder()
+        .stdout(&frame_stream("I called it.", ""))
+        .calls_mcp_tool("add", &serde_json::json!({"left": 4, "right": 5}))
+        .build();
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let mut req = request("add 4 and 5");
+    req.tools = vec![rig_core::completion::ToolDefinition {
+        name: "add".to_owned(),
+        description: "Add".to_owned(),
+        parameters: serde_json::json!({"type": "object"}),
+    }];
+    let mut stream = model.stream(req).await.unwrap();
+
+    let mut calls = Vec::new();
+    while let Some(item) = stream.next().await {
+        if let Ok(StreamedAssistantContent::ToolCall { tool_call, .. }) = item {
+            calls.push(tool_call);
+        }
+    }
+
+    assert_eq!(calls.len(), 1, "the recorded call must reach the stream");
+    assert_eq!(calls[0].function.name, "add");
+    assert_eq!(
+        calls[0].function.arguments.get("left"),
+        Some(&serde_json::json!(4))
+    );
+}
+
+#[tokio::test]
+async fn two_calls_in_one_turn_both_come_back_in_order() {
+    let fake = FakeClaude::builder()
+        .stdout(&envelope("done"))
+        .calls_mcp_tool("add", &serde_json::json!({"left": 1, "right": 1}))
+        .calls_mcp_tool("add", &serde_json::json!({"left": 2, "right": 2}))
+        .build();
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let mut req = request("do both");
+    req.tools = vec![rig_core::completion::ToolDefinition {
+        name: "add".to_owned(),
+        description: "Add".to_owned(),
+        parameters: serde_json::json!({"type": "object"}),
+    }];
+    let response = model.completion(req).await.unwrap();
+
+    let calls: Vec<_> = response
+        .choice
+        .iter()
+        .filter_map(|c| match c {
+            AssistantContent::ToolCall(call) => Some(call.function.arguments.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].get("left"), Some(&serde_json::json!(1)));
+    assert_eq!(calls[1].get("left"), Some(&serde_json::json!(2)));
+    let ids: std::collections::HashSet<_> = response
+        .choice
+        .iter()
+        .filter_map(|c| match c {
+            AssistantContent::ToolCall(call) => Some(call.id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids.len(), 2, "each call gets its own id");
+}
+
+#[tokio::test]
+async fn a_call_to_a_tool_the_bridge_does_not_serve_is_still_recorded() {
+    // The bridge is not the arbiter of what exists; rig is. A call to an
+    // unknown name reaches rig, whose runner reports it as an invalid tool
+    // call through its own machinery, with the model told so on the next
+    // turn. Swallowing it here would hide the model's mistake.
+    let fake = FakeClaude::builder()
+        .stdout(&envelope("hm"))
+        .calls_mcp_tool("no_such_tool", &serde_json::json!({}))
+        .build();
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let mut req = request("hi");
+    req.tools = vec![rig_core::completion::ToolDefinition {
+        name: "add".to_owned(),
+        description: "Add".to_owned(),
+        parameters: serde_json::json!({"type": "object"}),
+    }];
+    let response = model.completion(req).await.unwrap();
+
+    match response.choice.first() {
+        AssistantContent::ToolCall(call) => assert_eq!(call.function.name, "no_such_tool"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_call_with_no_arguments_is_recorded_with_an_empty_object() {
+    let fake = FakeClaude::builder()
+        .stdout(&envelope("hm"))
+        .calls_mcp_tool("ping", &serde_json::json!({}))
+        .build();
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let mut req = request("hi");
+    req.tools = vec![rig_core::completion::ToolDefinition {
+        name: "ping".to_owned(),
+        description: "Ping".to_owned(),
+        parameters: serde_json::json!({"type": "object"}),
+    }];
+    let response = model.completion(req).await.unwrap();
+
+    match response.choice.first() {
+        AssistantContent::ToolCall(call) => {
+            assert_eq!(call.function.arguments, serde_json::json!({}));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn tool_choice_none_starts_no_bridge_and_advertises_nothing() {
+    let fake = FakeClaude::printing(&envelope("plain"));
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let mut req = request("hi");
+    req.tools = vec![rig_core::completion::ToolDefinition {
+        name: "add".to_owned(),
+        description: "Add".to_owned(),
+        parameters: serde_json::json!({"type": "object"}),
+    }];
+    req.tool_choice = Some(rig_core::message::ToolChoice::None);
+    let response = model.completion(req).await.unwrap();
+
+    assert_eq!(text_of(&response), "plain");
+    assert!(
+        fake.value_after("--mcp-config").is_none(),
+        "{:?}",
+        fake.argv()
+    );
+    assert!(fake.value_after("--allowedTools").is_none());
+    assert_eq!(fake.system_prompt(), None, "no tool instructions either");
 }
 
 #[tokio::test]

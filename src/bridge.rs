@@ -63,6 +63,11 @@ impl RecordedCall {
     pub(crate) fn into_content(self) -> AssistantContent {
         AssistantContent::tool_call(self.id, self.name, self.arguments)
     }
+
+    /// The call as rig expects to see it in a stream.
+    pub(crate) fn into_raw(self) -> rig_core::streaming::RawStreamingToolCall {
+        rig_core::streaming::RawStreamingToolCall::new(self.id, self.name, self.arguments)
+    }
 }
 
 /// The handler behind the per-turn server: rig's tools, and what was called.

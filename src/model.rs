@@ -605,6 +605,9 @@ impl CompletionModel for ClaudeCodeModel {
             // cancelled before the prompt is written.
             let _system_file = system_file;
             let _feed = feed;
+            // Held for the whole stream so the CLI can reach the bridge until
+            // the turn ends.
+            let bridge = bridge;
             let mut stopped_early = false;
 
             let mut lines = streaming::Lines::new(stdout);
@@ -679,10 +682,9 @@ impl CompletionModel for ClaudeCodeModel {
                     streaming::Event::Emit(choice) => yield Ok(choice),
                     streaming::Event::Finish(result) => {
                         saw_terminal_frame = true;
-                        if let Some(id) = result.session_id.clone() {
-                            yield Ok(RawStreamingChoice::MessageId(id));
+                        for choice in finish_items(bridge.as_ref(), *result) {
+                            yield Ok(choice);
                         }
-                        yield Ok(RawStreamingChoice::FinalResponse(*result));
                         // The terminal frame ends the turn. Reading on to
                         // end-of-file would wait for every process holding the
                         // pipe open, including a grandchild the CLI left
@@ -820,6 +822,30 @@ fn conclude(
             "waiting for `{program}`: {error}"
         ))),
     }
+}
+
+/// The items a stream yields when its terminal frame arrives.
+///
+/// The session id, then every tool call the CLI made, then the final
+/// response. Text deltas already went out and cannot be retracted the way
+/// the blocking path discards its text; what rig's runner needs to decide it
+/// must run tools is the calls themselves, so they go out ahead of the final
+/// response.
+fn finish_items(
+    bridge: Option<&Bridge>,
+    result: CliResponse,
+) -> Vec<RawStreamingChoice<CliResponse>> {
+    let mut items = Vec::new();
+    if let Some(id) = result.session_id.clone() {
+        items.push(RawStreamingChoice::MessageId(id));
+    }
+    if let Some(bridge) = bridge {
+        for call in bridge.take_calls() {
+            items.push(RawStreamingChoice::ToolCall(call.into_raw()));
+        }
+    }
+    items.push(RawStreamingChoice::FinalResponse(result));
+    items
 }
 
 /// The deadline passed before a line arrived.
