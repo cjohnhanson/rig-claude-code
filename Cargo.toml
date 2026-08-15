@@ -2,7 +2,8 @@
 name = "rig-claude-code"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# 1.88 stabilized let chains on edition 2024, which src/streaming.rs uses.
+rust-version = "1.88"
 license = "MIT"
 description = "A rig completion model backed by the Claude Code CLI, authenticated by a Claude subscription instead of an API key."
 repository = "https://github.com/cjohnhanson/rig-claude-code"

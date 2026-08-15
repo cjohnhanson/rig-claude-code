@@ -27,6 +27,16 @@ jobs:
       - run: cargo test
       - run: cargo doc --no-deps
 
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Must match `rust-version` in Cargo.toml. 1.88 is the floor because
+      # src/streaming.rs uses a let chain, stabilized there on edition 2024.
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
+
   coverage:
     runs-on: ubuntu-latest
     steps:
