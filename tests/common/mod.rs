@@ -21,6 +21,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// Marker in a stdout fixture where the fake pauses mid-output.
+///
+/// Place it at the *start* of a line, after the previous line's newline. A
+/// marker at the end of a line splits that line from its terminator, so the
+/// reader holds the first half as an unfinished line and cannot yield it
+/// until the pause ends — which defeats every test that asserts a delta
+/// arrives before the turn does.
 pub const PAUSE: &str = "%%PAUSE%%";
 
 /// A scripted stand-in for the `claude` binary.
@@ -318,13 +324,21 @@ impl FakeClaudeBuilder {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path();
 
-        let stdout = if self.delay_mid.is_some() {
-            self.stdout.clone()
-        } else {
+        // A pause inside stdout is expressed by splitting the fixture on the
+        // marker at build time and writing the halves as two files. The
+        // script then emits one, sleeps, and emits the other. Doing the split
+        // here rather than in the script keeps the shell portable: the awk
+        // that used to do it relied on `RT`, a gawk extension, and Ubuntu's
+        // default mawk never sets it — so the pause silently never happened
+        // and every "arrives before the turn ends" test was reading a
+        // completed buffer.
+        let (first_half, second_half) = match (self.delay_mid, self.stdout.split_once(PAUSE)) {
+            (Some(_), Some((first, second))) => (first.to_owned(), second.to_owned()),
             // An unused marker would otherwise reach the stream as content.
-            self.stdout.replace(PAUSE, "")
+            _ => (self.stdout.replace(PAUSE, ""), String::new()),
         };
-        fs::write(path.join("stdout"), &stdout).expect("write stdout fixture");
+        fs::write(path.join("stdout"), &first_half).expect("write stdout fixture");
+        fs::write(path.join("stdout2"), &second_half).expect("write stdout tail fixture");
         fs::write(path.join("stderr"), &self.stderr).expect("write stderr fixture");
 
         let sleep_before = self
@@ -336,8 +350,7 @@ impl FakeClaudeBuilder {
         // marker and sleeping between the halves.
         let emit_stdout = match self.delay_mid {
             Some(seconds) => format!(
-                "awk 'BEGIN{{RS=\"{PAUSE}\"}}{{printf \"%s\", $0; fflush(); \
-                 if (RT != \"\") system(\"sleep {seconds}\")}}' \"$here/stdout\"\n"
+                "cat \"$here/stdout\"\nsleep {seconds}\ncat \"$here/stdout2\"\n"
             ),
             None => "cat \"$here/stdout\"\n".to_owned(),
         };
@@ -413,7 +426,11 @@ env > "$here/env"
 for a in "$@"; do
   if [ -n "$next_is_sp" ]; then
     {system_prompt_wait}cp "$a" "$here/system_prompt" 2>/dev/null
-    {{ stat -f '%Lp' "$a" 2>/dev/null || stat -c '%a' "$a" 2>/dev/null; }} > "$here/system_prompt_mode"
+    # GNU stat and BSD stat disagree on every flag. Try the GNU spelling
+    # first, and only if it prints nothing fall back to BSD.
+    mode=$(stat -c '%a' "$a" 2>/dev/null)
+    [ -n "$mode" ] || mode=$(stat -f '%Lp' "$a" 2>/dev/null)
+    printf '%s\n' "$mode" > "$here/system_prompt_mode"
     next_is_sp=
   fi
   if [ "$a" = "--system-prompt-file" ]; then next_is_sp=1; fi

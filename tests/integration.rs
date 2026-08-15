@@ -761,8 +761,8 @@ fn frame_stream(text_a: &str, text_b: &str) -> String {
 {{"type":"stream_event","event":{{"type":"message_start","message":{{}}}}}}
 {{"type":"stream_event","event":{{"type":"content_block_delta","index":0,"delta":{{"type":"thinking_delta","thinking":"pondering"}}}}}}
 {{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed"}}}}
-{{"type":"stream_event","event":{{"type":"content_block_delta","index":1,"delta":{{"type":"text_delta","text":"{text_a}"}}}}}}{PAUSE}
-{{"type":"stream_event","event":{{"type":"content_block_delta","index":1,"delta":{{"type":"text_delta","text":"{text_b}"}}}}}}
+{{"type":"stream_event","event":{{"type":"content_block_delta","index":1,"delta":{{"type":"text_delta","text":"{text_a}"}}}}}}
+{PAUSE}{{"type":"stream_event","event":{{"type":"content_block_delta","index":1,"delta":{{"type":"text_delta","text":"{text_b}"}}}}}}
 {{"type":"stream_event","event":{{"type":"message_stop"}}}}
 {{"type":"result","is_error":false,"subtype":"success","result":"{text_a}{text_b}","session_id":"s-7","usage":{{"input_tokens":8,"output_tokens":4,"output_tokens_details":{{"thinking_tokens":2}}}}}}
 "#
