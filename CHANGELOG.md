@@ -24,7 +24,11 @@ The public surface, in full:
   `OutputTokenDetails`, the `models` module, `BINARY_ENV`, `DEFAULT_BINARY`.
 - Blocking completion and streaming. Streaming reads the CLI's newline-
   delimited JSON frames and emits token-level text and reasoning deltas.
-- Native structured output through the CLI's `--json-schema`.
+- Native structured output through the CLI's `--json-schema`, on the blocking
+  path. schemars 1.x's `$schema` pointer to the 2020-12 metaschema is stripped
+  first: Claude Code 2.1.233 cannot resolve it and rejects the schema outright,
+  so without that every `prompt_typed` turn failed. A streamed turn yields the
+  model's pre-enforcement prose; the enforced JSON is in the terminal frame.
 - `UnsupportedSetting`: a public, downcastable cause for every request setting
   the transport cannot express — tool definitions, `temperature`, `max_tokens`,
   `additional_params`, any `tool_choice` other than `None`, a last message with

@@ -34,7 +34,9 @@
 //!
 //! Preambles and system messages, context documents, multi-turn history,
 //! token accounting, native structured output through the CLI's
-//! `--json-schema`, and streaming with token-level text and reasoning deltas.
+//! `--json-schema` (on the blocking path; a streamed turn yields the model's
+//! pre-enforcement prose), and streaming with token-level text and reasoning
+//! deltas.
 //! rig-level features that need nothing from a provider — conversation memory,
 //! agent hooks — work here as they do anywhere. (Those are rig's hooks; the
 //! CLI's own hooks are deliberately not loaded.)

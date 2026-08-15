@@ -176,7 +176,7 @@ pub(crate) fn build(
         // value can never be flag-shaped. Verified against Claude Code
         // 2.1.233: the CLI's pre-parse scan for `--settings=` matches the
         // start of an argv element, not a substring of it.
-        let serialized = serde_json::to_string(schema)?;
+        let serialized = serde_json::to_string(&portable_schema(schema))?;
         if serialized.len() > MAX_SCHEMA_BYTES {
             // The CLI has no `--json-schema-file`, so this is the one
             // caller-sized value still in argv. Naming the limit beats letting
@@ -214,6 +214,24 @@ pub(crate) fn build(
         stdin: render_prompt(request),
         system_prompt: render_system(request),
     })
+}
+
+/// The schema as the CLI will accept it.
+///
+/// schemars 1.x, which rig 0.41 pins, stamps every schema with
+/// `"$schema": "https://json-schema.org/draft/2020-12/schema"`. Claude Code
+/// 2.1.233's validator cannot resolve that URI and rejects the whole schema
+/// before any API call — `no schema with key or ref …` — so every
+/// `prompt_typed` and `output_schema::<T>()` turn would fail. The body of the
+/// schema is fine; only the metaschema pointer is the problem, and it carries
+/// no constraint of its own. Verified: the same schema minus `$schema` is
+/// accepted and honored.
+fn portable_schema(schema: &rig_core::schemars::Schema) -> serde_json::Value {
+    let mut value = schema.clone().to_value();
+    if let Some(object) = value.as_object_mut() {
+        object.remove("$schema");
+    }
+    value
 }
 
 /// Reject request settings the CLI has no way to express.
@@ -1115,6 +1133,38 @@ mod tests {
         let sent = value_after(&spec, "--json-schema").unwrap();
         let parsed: serde_json::Value = serde_json::from_str(sent).unwrap();
         assert_eq!(parsed.get("type"), Some(&serde_json::json!("string")));
+    }
+
+    #[test]
+    fn strips_the_metaschema_pointer_the_cli_cannot_resolve() {
+        // schemars stamps `$schema: …/draft/2020-12/schema` on every schema,
+        // and Claude Code 2.1.233 rejects that outright before any API call.
+        // Verified against the real binary in both directions.
+        #[derive(rig_core::schemars::JsonSchema)]
+        #[allow(dead_code)]
+        struct Person {
+            name: String,
+            age: u8,
+        }
+        let generated = rig_core::schemars::schema_for!(Person);
+        assert!(
+            generated.clone().to_value().get("$schema").is_some(),
+            "the premise: schemars emits a $schema key"
+        );
+
+        let mut req = request("hi");
+        req.output_schema = Some(generated);
+        let spec = spec_for(&req);
+        let sent = value_after(&spec, "--json-schema").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(sent).unwrap();
+        assert!(parsed.get("$schema").is_none(), "{parsed}");
+        assert!(
+            parsed
+                .get("properties")
+                .and_then(|p| p.get("name"))
+                .is_some(),
+            "the constraint survives: {parsed}"
+        );
     }
 
     #[test]

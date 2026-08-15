@@ -151,7 +151,18 @@ paths against a real binary.
 The CLI has a `--json-schema` flag, so native structured output works and needs
 no special mode. `OutputMode::Auto`, the default, resolves to `Native` for an
 agent with no tools — and this transport carries no tools (see *What the
-transport cannot do*), so it always does.
+transport cannot do*), so it always does. schemars stamps every schema with a
+`$schema` pointer to the 2020-12 metaschema, which Claude Code 2.1.233's
+validator cannot resolve and rejects outright; the crate strips that one key
+before passing the schema, and nothing else.
+
+**Blocking only.** The CLI enforces a schema as a second internal turn after
+the model's first answer. A blocking turn returns the enforced JSON. A
+*streaming* turn yields the model's first, unconstrained answer as text
+deltas, and the enforced JSON appears only in the terminal frame — so
+`stream_prompt` on a schema-bearing agent streams prose, not JSON. Use the
+blocking path for structured output. `cargo run --example typed_output`
+exercises it against a real binary.
 
 ```rust,no_run
 use rig::completion::TypedPrompt;
