@@ -2,6 +2,7 @@
 //! and its translation into rig's canonical response types.
 
 use rig_core::OneOrMany;
+use rig_core::ProviderResponseError;
 use rig_core::completion::{
     AssistantContent, CompletionError, CompletionResponse, GetTokenUsage, Usage,
 };
@@ -192,17 +193,34 @@ impl CliResponse {
     }
 
     /// The error this envelope describes, if it describes one.
+    ///
+    /// The whole envelope travels as the error's body rather than being
+    /// flattened into a message. A usage limit, a rate limit, and an
+    /// unrecognized model all arrive this way, and a caller that wants to back
+    /// off on one and fail hard on another needs to branch on `subtype` —
+    /// which a formatted string does not allow. rig exposes the body through
+    /// `provider_response_json`:
+    ///
+    /// ```no_run
+    /// # use rig_core::completion::CompletionError;
+    /// # fn example(error: &CompletionError) {
+    /// if let Ok(Some(body)) = error.provider_response_json() {
+    ///     match body.get("subtype").and_then(|s| s.as_str()) {
+    ///         Some("error_max_turns") => { /* retry with a larger budget */ }
+    ///         Some(other) => eprintln!("claude refused: {other}"),
+    ///         None => {}
+    ///     }
+    /// }
+    /// # }
+    /// ```
     pub(crate) fn failure(&self) -> Option<CompletionError> {
         self.failed().then(|| {
-            CompletionError::ProviderError(format!(
-                "claude reported a failed turn ({}): {}",
-                if self.subtype.is_empty() {
-                    "no subtype"
-                } else {
-                    self.subtype.as_str()
-                },
-                self.result.as_deref().unwrap_or("no detail")
-            ))
+            // Serializing an envelope that was itself deserialized from JSON
+            // cannot fail: every field is a string, bool, number, option, or
+            // JSON map. `unwrap_or_default` keeps the crate free of `expect`
+            // without inventing a fallback body for a case that cannot occur.
+            let body = serde_json::to_string(self).unwrap_or_default();
+            CompletionError::ProviderResponse(ProviderResponseError { status: None, body })
         })
     }
 
@@ -546,17 +564,40 @@ mod tests {
     }
 
     #[test]
-    fn describes_a_failed_turn_that_carries_no_detail() {
-        let parsed = parse(br#"{"is_error":true,"subtype":"error_max_turns"}"#).unwrap();
+    fn a_failure_carries_the_whole_envelope_for_the_caller_to_branch_on() {
+        // A rate limit and an unrecognized model are both failed turns. A
+        // caller that backs off on one and fails hard on the other needs the
+        // subtype as data, not inside a sentence.
+        let parsed =
+            parse(br#"{"is_error":true,"subtype":"error_max_turns","result":"gave up"}"#).unwrap();
         let error = parsed.into_completion_response().unwrap_err();
-        assert!(error.to_string().contains("no detail"), "{error}");
+
+        let body: serde_json::Value = error
+            .provider_response_json()
+            .expect("the body is valid JSON")
+            .expect("the failure carries a provider response");
+        assert_eq!(
+            body.get("subtype").and_then(serde_json::Value::as_str),
+            Some("error_max_turns")
+        );
+        assert_eq!(
+            body.get("result").and_then(serde_json::Value::as_str),
+            Some("gave up")
+        );
     }
 
     #[test]
-    fn describes_a_failed_turn_that_carries_no_subtype() {
+    fn a_failure_with_no_detail_still_carries_its_subtype() {
+        let parsed = parse(br#"{"is_error":true,"subtype":"error_max_turns"}"#).unwrap();
+        let error = parsed.into_completion_response().unwrap_err();
+        assert!(error.to_string().contains("error_max_turns"), "{error}");
+    }
+
+    #[test]
+    fn a_failure_with_no_subtype_still_carries_its_detail() {
         let parsed = parse(br#"{"is_error":true,"result":"boom"}"#).unwrap();
         let error = parsed.into_completion_response().unwrap_err();
-        assert!(error.to_string().contains("no subtype"), "{error}");
+        assert!(error.to_string().contains("boom"), "{error}");
     }
 
     #[test]

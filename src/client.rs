@@ -69,6 +69,9 @@ pub enum ClientError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClaudeCodeClient {
     binary: String,
+    timeout: Option<std::time::Duration>,
+    extra_args: Vec<String>,
+    current_dir: Option<String>,
 }
 
 impl ClaudeCodeClient {
@@ -81,6 +84,62 @@ impl ClaudeCodeClient {
     pub fn new(binary: impl Into<String>) -> Self {
         Self {
             binary: binary.into(),
+            timeout: None,
+            extra_args: Vec::new(),
+            current_dir: None,
+        }
+    }
+
+    /// Bound every turn this client's models run.
+    ///
+    /// Carried onto each [`ClaudeCodeModel`] the client builds, so
+    /// `client.agent(..)` inherits it. Without a timeout here or on the model,
+    /// a wedged child holds the caller forever.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Pass additional CLI arguments on every turn.
+    ///
+    /// See [`ClaudeCodeModel::with_args`] for the rules; an argument that
+    /// collides with a flag the crate sets is refused when the turn runs.
+    #[must_use]
+    pub fn with_args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.extra_args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    /// Give the CLI an MCP server configuration on every turn.
+    #[must_use]
+    pub fn with_mcp_config(self, path: impl Into<String>) -> Self {
+        self.with_args(["--mcp-config".to_owned(), path.into()])
+    }
+
+    /// Run every child in a specific working directory.
+    #[must_use]
+    pub fn with_current_dir(mut self, dir: impl Into<String>) -> Self {
+        self.current_dir = Some(dir.into());
+        self
+    }
+
+    /// Apply this client's settings to a model it built.
+    pub(crate) fn configure(&self, model: ClaudeCodeModel) -> ClaudeCodeModel {
+        let model = model
+            .with_binary(&self.binary)
+            .with_args(self.extra_args.clone());
+        let model = match self.timeout {
+            Some(timeout) => model.with_timeout(timeout),
+            None => model,
+        };
+        match &self.current_dir {
+            Some(dir) => model.with_current_dir(dir),
+            None => model,
         }
     }
 
@@ -164,7 +223,7 @@ impl ProviderClient for ClaudeCodeClient {
             });
         }
 
-        Ok(Self { binary })
+        Ok(Self::new(binary))
     }
 
     /// Build a client for the binary at `input`, without checking that it runs.
@@ -223,5 +282,24 @@ mod tests {
         let model = client.completion_model("haiku");
         assert_eq!(model.binary(), "/opt/claude");
         assert_eq!(model.model(), "haiku");
+    }
+
+    #[test]
+    fn builds_a_model_carrying_every_client_setting() {
+        // `client.agent(..)` is the documented construction route, and it goes
+        // through `completion_model`. Settings that stopped here would be
+        // unreachable from the only path the README shows.
+        let client = ClaudeCodeClient::new("/opt/claude")
+            .with_timeout(std::time::Duration::from_secs(9))
+            .with_mcp_config("/etc/mcp.json")
+            .with_current_dir("/srv");
+        let model = client.completion_model("haiku");
+
+        assert_eq!(model.timeout(), Some(std::time::Duration::from_secs(9)));
+        assert_eq!(model.current_dir(), Some("/srv"));
+        assert_eq!(
+            model.extra_args(),
+            ["--mcp-config".to_owned(), "/etc/mcp.json".to_owned()]
+        );
     }
 }

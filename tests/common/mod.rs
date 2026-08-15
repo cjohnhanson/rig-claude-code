@@ -155,6 +155,19 @@ impl FakeClaude {
         self.read("spawns").map_or(0, |text| text.trim().len())
     }
 
+    /// The names of every variable in the child's environment.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the fake was never invoked.
+    pub fn child_env(&self) -> Vec<String> {
+        self.read("env")
+            .expect("the fake was never invoked")
+            .lines()
+            .map(|line| line.split('=').next().unwrap_or_default().to_owned())
+            .collect()
+    }
+
     /// Whether `CLAUDECODE` was set in the child's environment.
     ///
     /// # Panics
@@ -394,6 +407,7 @@ printf '%s\0' "$@" > "$here/argv"
 {pre_stdin}cat > "$here/stdin"
 printf 'x' >> "$here/spawns"
 pwd > "$here/cwd"
+env > "$here/env"
 # Copy the system prompt while the child is alive: the caller deletes the
 # temporary file as soon as the turn ends.
 for a in "$@"; do

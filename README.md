@@ -1,5 +1,9 @@
 # rig-claude-code
 
+[![CI](https://github.com/cjohnhanson/rig-claude-code/actions/workflows/ci.yml/badge.svg)](https://github.com/cjohnhanson/rig-claude-code/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/rig-claude-code.svg)](https://crates.io/crates/rig-claude-code)
+[![docs.rs](https://docs.rs/rig-claude-code/badge.svg)](https://docs.rs/rig-claude-code)
+
 A [rig](https://github.com/0xPlaygrounds/rig) completion model backed by the
 Claude Code CLI.
 
@@ -16,7 +20,7 @@ it yourself before relying on it.
 
 [cc-plan]: https://support.claude.com/en/articles/11145838-use-claude-code-with-your-pro-or-max-plan
 
-```rust
+```rust,no_run
 use rig::completion::Prompt;
 use rig::prelude::*;
 use rig_claude_code::{ClaudeCodeClient, models};
@@ -35,9 +39,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The client implements the ordinary provider traits, so `client.agent(..)`,
-`client.completion_model(..)`, and `client.verify()` compose exactly as they do
-for a built-in provider.
+The client implements the same traits as a built-in provider —
+`ProviderClient`, `CompletionClient`, `VerifyClient` — so `client.agent(..)`,
+`client.completion_model(..)`, and `client.verify()` all work. One difference:
+`ProviderClient::Error` is this crate's `ClientError` rather than rig's
+`ProviderClientError`, so generic code bounded on the latter will not take it.
+
+Every setting lives on the client and is inherited by each agent it builds:
+
+```rust,no_run
+use std::time::Duration;
+use rig::prelude::*;
+use rig_claude_code::{ClaudeCodeClient, models};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let client = ClaudeCodeClient::from_env()?
+    .with_timeout(Duration::from_secs(120))
+    .with_mcp_config("/etc/agent/mcp.json")
+    .with_current_dir("/srv/workspace");
+
+let agent = client.agent(models::HAIKU).build();
+# let _ = agent;
+# Ok(())
+# }
+```
+
+`ClaudeCodeModel` carries the same `with_*` methods for building a model
+directly. `rig_claude_code::Client` and `rig_claude_code::CompletionModel`
+alias the two types under the names the rig ecosystem uses.
 
 ## Install
 
@@ -50,7 +79,12 @@ rig = "0.41"
 It needs a `claude` binary on `PATH` that is already logged in.
 `ClaudeCodeClient::from_env` reads `RIG_CLAUDE_CODE_BIN` to find it elsewhere;
 `ClaudeCodeModel::with_binary` is the equivalent when building a model
-directly.
+directly. `from_env` and `verify()` confirm the binary runs — they cannot
+confirm it is logged in, which only a real turn establishes. A logged-out CLI
+fails the first turn with a usage-style refusal (see below).
+
+A turn needs a tokio runtime with I/O and time enabled, which
+`#[tokio::main]` and `Runtime::new()` both provide.
 
 ## Choosing a model
 
@@ -133,7 +167,43 @@ and fall back to another provider instead of matching on message text.
 results cannot cross the prompt, so each is replaced by a visible placeholder —
 `[an image was omitted: this transport sends text only]` — rather than dropped.
 A model told that a picture was omitted behaves very differently from one shown
-a message with a hole in it.
+a message with a hole in it. A request whose last message renders to no text
+is refused outright, because the CLI needs a prompt and a transcript with
+nothing after it is answered as if it were the question.
+
+**History is flattened, not replayed.** The CLI takes one prompt, so prior
+turns are rendered into it as a labelled transcript. Every marker — the section
+tags, the `user`/`assistant` labels, each document's wrapper — carries a
+per-request nonce, so message text cannot forge a turn or close a section
+early. Two consequences worth knowing: a `Message::System` anywhere in the
+history is hoisted into the system prompt, so an instruction injected after
+turn three arrives as if it had been there from the start; and a trailing
+`Message::System` is sent as the system prompt *and* as the prompt. Each turn
+is a fresh process. The `session_id` the CLI reports is surfaced as rig's
+`message_id` for observability only; feeding it back does not resume anything.
+
+## Failed turns
+
+A usage limit, a rate limit, a logged-out CLI, and an unrecognized model all
+arrive the same way: a well-formed envelope with an `error` subtype, on stdout,
+often alongside exit 1. The crate reads the envelope before the exit status
+so the explanation is never lost, and returns it as
+`CompletionError::ProviderResponse` with the whole envelope as the body. Branch
+on `subtype` rather than on message text:
+
+```rust,no_run
+use rig::completion::CompletionError;
+
+# fn handle(error: &CompletionError) {
+if let Ok(Some(body)) = error.provider_response_json() {
+    match body.get("subtype").and_then(|s| s.as_str()) {
+        Some("error_max_turns") => { /* raise the budget and retry */ }
+        Some(other) => eprintln!("claude refused: {other}"),
+        None => {}
+    }
+}
+# }
+```
 
 ## Why the invocation looks the way it does
 
@@ -171,11 +241,27 @@ from inside a Claude Code session does not treat itself as nested.
 
 Every turn is one child process, killed when the future or stream driving it is
 dropped — so an abandoned turn does not leave a `claude` running and spending
-the login's usage. There is no default timeout: set
-`ClaudeCodeModel::with_timeout` to bound a turn that never finishes on its own.
+the login's usage. That kill reaches the child, not its descendants: an MCP
+server the CLI started may outlive the turn. There is no default timeout; set
+`with_timeout` on the client or model to bound a turn that never finishes on
+its own. The bound covers the whole turn, including the short grace periods
+spent draining pipes after the child exits.
+
+Output is capped at 16 MiB per turn. A child that exceeds it is reported as
+such, not as a protocol break.
 
 Concurrent turns are concurrent processes. Each one starts a Node runtime, so
 the practical ceiling is much lower than for an HTTP provider.
+
+## Tools through MCP
+
+`with_mcp_config` is the route to tools, and the invocation pairs it with
+`--strict-mcp-config` so nothing else is loaded. Two things the CLI needs
+beyond the config: a non-interactive `-p` run only calls a tool the caller has
+pre-approved, so pass `--allowedTools` (or a permission mode) through
+`with_args`; and the tools stay under the CLI's control — rig never sees them,
+never observes their calls, and registering a rig tool on the agent still
+fails.
 
 ## Trust model
 
@@ -184,17 +270,21 @@ The binary runs with the host process's full privileges, so both `PATH` and
 to execute. Prefer an absolute path. Note that `from_env` runs the binary
 immediately, so constructing a client executes whatever the variable names.
 
-The child inherits the environment except `CLAUDECODE`. Two variables in the
-parent environment can quietly change what the crate does: `ANTHROPIC_API_KEY`
-makes the CLI bill an API account rather than the subscription, and
-`ANTHROPIC_BASE_URL` sends every prompt to a different endpoint.
+The child inherits the environment, minus every Claude Code session marker
+(`CLAUDECODE`, `CLAUDE_*`, `AI_AGENT`) — a live session exports a messaging
+socket and token, a session id, and `CLAUDE_EFFORT`, which would silently
+change the effort level and cost of every turn depending on who launched the
+host process. Several other variables the CLI honors are *not* stripped and can
+quietly change what the crate does, among them `ANTHROPIC_API_KEY` and
+`ANTHROPIC_AUTH_TOKEN` (bill an API account rather than the subscription),
+`ANTHROPIC_BASE_URL` (send every prompt elsewhere), and `ANTHROPIC_MODEL`.
 
 Supported on Unix. Windows is untested and not covered by CI.
 
 ## Testing
 
 ```console
-cargo test          # unit, integration, and doc tests
+cargo test          # unit, integration, and doc tests — spends no usage
 cargo llvm-cov      # coverage
 cargo clippy --all-targets
 ```
@@ -213,10 +303,16 @@ usage.
 ## Compatibility
 
 Built against rig 0.41 and Claude Code 2.1.233. rig ships breaking changes on
-most minor releases, so treat the version pin as load-bearing. The CLI's flags
-and output shape are likewise a moving target; the response types keep unknown
-fields rather than rejecting them, and a `null` or fractional value where a
-number is expected is tolerated rather than fatal.
+most minor releases, so treat the version pin as load-bearing; the MSRV of 1.88
+is really "whatever rig-core needs today," since rig-core declares none. The
+CLI's flags and output shape are likewise a moving target; the response types
+keep unknown fields rather than rejecting them, and a `null` or fractional
+value where a number is expected is tolerated rather than fatal.
+
+One flag deserves naming: `--system-prompt-file`, which carries the injection
+defence, is not in `claude --help`'s option list in 2.1.233 — it appears only
+inside the `--bare` description. It works, but losing it would take the crate
+out rather than degrade it.
 
 ## Terms of service
 

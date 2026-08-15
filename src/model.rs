@@ -8,6 +8,7 @@ use rig_core::completion::{
     CompletionError, CompletionModel, CompletionRequest, CompletionResponse,
 };
 use rig_core::streaming::{RawStreamingChoice, StreamingCompletionResponse};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -19,11 +20,29 @@ use crate::request::CommandSpec;
 use crate::response::{self, CliResponse};
 use crate::{request, streaming};
 
-/// Environment variable Claude Code sets to mark a nested session.
+/// Environment variables a live Claude Code session exports, all of which are
+/// removed from the child's environment.
 ///
-/// It is removed from the child's environment: with it set, a `claude`
-/// launched from inside a Claude Code session treats itself as nested.
-const NESTED_SESSION_ENV: &str = "CLAUDECODE";
+/// `CLAUDECODE` alone is not enough. A session also exports a messaging socket
+/// and token, a session id, an entrypoint, and `CLAUDE_EFFORT` — which would
+/// silently change the effort level of every turn depending on who launched
+/// the host process, and with it both the cost and the reproducibility of the
+/// invocation. Prefixes are matched, so a marker added by a later version is
+/// stripped too.
+const SESSION_ENV_PREFIXES: &[&str] = &["CLAUDECODE", "CLAUDE_", "AI_AGENT"];
+
+/// Remove every inherited Claude Code session marker from `command`.
+fn strip_session_markers(command: &mut Command) {
+    for (name, _) in std::env::vars_os() {
+        let Some(name) = name.to_str() else { continue };
+        if SESSION_ENV_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            command.env_remove(name);
+        }
+    }
+}
 
 /// Flags this crate sets itself, which [`ClaudeCodeModel::with_args`] must not
 /// duplicate.
@@ -126,6 +145,8 @@ impl Drop for AbortOnDrop {
 struct Drain {
     task: AbortOnDrop,
     buffer: Arc<Mutex<Vec<u8>>>,
+    /// Whether the retention limit was reached and output discarded.
+    truncated: Arc<AtomicBool>,
 }
 
 impl Drain {
@@ -139,7 +160,9 @@ impl Drain {
         R: tokio::io::AsyncRead + Unpin + Send + 'static,
     {
         let buffer = Arc::new(Mutex::new(Vec::new()));
+        let truncated = Arc::new(AtomicBool::new(false));
         let sink = Arc::clone(&buffer);
+        let overflowed = Arc::clone(&truncated);
         let task = tokio::spawn(async move {
             let mut chunk = vec![0; 8192];
             loop {
@@ -149,6 +172,9 @@ impl Drain {
                         let slice = chunk.get(..read).unwrap_or_default();
                         let Ok(mut kept) = sink.lock() else { break };
                         let room = limit.saturating_sub(kept.len());
+                        if room < read {
+                            overflowed.store(true, Ordering::Relaxed);
+                        }
                         if room > 0 {
                             kept.extend_from_slice(slice.get(..room.min(read)).unwrap_or_default());
                         }
@@ -159,7 +185,13 @@ impl Drain {
         Self {
             task: AbortOnDrop(task),
             buffer,
+            truncated,
         }
+    }
+
+    /// Whether output was discarded for exceeding the retention limit.
+    fn truncated(&self) -> bool {
+        self.truncated.load(Ordering::Relaxed)
     }
 
     /// Everything read so far, without waiting for the pipe to close.
@@ -175,7 +207,11 @@ impl Drain {
     /// Whatever arrived is returned either way: a pipe still held open by a
     /// grandchild is not a reason to discard the bytes already read.
     async fn finish(self, grace: Duration) -> Vec<u8> {
-        let Self { mut task, buffer } = self;
+        let Self {
+            mut task,
+            buffer,
+            truncated: _,
+        } = self;
         let _ = tokio::time::timeout(grace, &mut task.0).await;
         // Dropping `task` aborts it, which is right either way: the read is
         // either finished or being abandoned, and the bytes are in the shared
@@ -299,6 +335,18 @@ impl ClaudeCodeModel {
         self.timeout
     }
 
+    /// The working directory the child runs in, if one is set.
+    #[must_use]
+    pub fn current_dir(&self) -> Option<&str> {
+        self.current_dir.as_deref()
+    }
+
+    /// The additional arguments passed to the CLI.
+    #[must_use]
+    pub fn extra_args(&self) -> &[String] {
+        &self.extra_args
+    }
+
     /// Reject extra arguments that would override a flag the crate sets.
     fn check_extra_args(&self) -> Result<(), CompletionError> {
         for arg in &self.extra_args {
@@ -346,11 +394,11 @@ impl ClaudeCodeModel {
         command
             .args(&spec.args)
             .args(&self.extra_args)
-            .env_remove(NESTED_SESSION_ENV)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        strip_session_markers(&mut command);
         if let Some(file) = &system_file {
             command
                 .arg("--system-prompt-file")
@@ -385,7 +433,7 @@ impl CompletionModel for ClaudeCodeModel {
     type Client = ClaudeCodeClient;
 
     fn make(client: &Self::Client, model: impl Into<String>) -> Self {
-        Self::new(model).with_binary(client.binary())
+        client.configure(Self::new(model))
     }
 
     async fn completion(
@@ -400,51 +448,61 @@ impl CompletionModel for ClaudeCodeModel {
         let stderr_drain = Drain::start(stderr, STDERR_LIMIT);
         let stdout_drain = Drain::start(stdout, STDOUT_LIMIT);
 
-        // Only the child is on the caller's clock. Charging the drain's grace
-        // period to it would fail a turn whose answer is already buffered.
-        let status = match self.timeout {
-            // Dropping `child` on the timeout path kills it, because the spawn
-            // set `kill_on_drop`.
-            Some(limit) => tokio::time::timeout(limit, child.wait())
-                .await
-                .map_err(|_| timed_out(&self.binary, limit))?,
-            None => child.wait().await,
-        };
-        drop(feed);
+        let binary = self.binary.clone();
+        let turn = async move {
+            let status = child.wait().await.map_err(|error| {
+                CompletionError::ProviderError(format!("waiting for `{binary}`: {error}"))
+            })?;
+            drop(feed);
 
-        let status = status.map_err(|error| {
-            CompletionError::ProviderError(format!("waiting for `{}`: {error}", self.binary))
-        })?;
+            // The envelope is usually complete the moment the child exits.
+            // Taking it here avoids waiting out the grace period when a
+            // grandchild is holding the pipe open, which is the whole reason
+            // the grace exists.
+            if let Some(envelope) = response::find_envelope(&stdout_drain.snapshot()) {
+                return envelope.into_completion_response();
+            }
+            let truncated = stdout_drain.truncated();
+            let stdout_bytes = stdout_drain.finish(STDOUT_GRACE).await;
 
-        // The envelope is usually complete the moment the child exits. Taking
-        // it here avoids waiting out the grace period when a grandchild is
-        // holding the pipe open, which is the whole reason the grace exists.
-        if let Some(envelope) = response::find_envelope(&stdout_drain.snapshot()) {
-            return envelope.into_completion_response();
-        }
-        let stdout_bytes = stdout_drain.finish(STDOUT_GRACE).await;
+            // The envelope comes first, whatever the exit status. The CLI
+            // reports a usage limit, a rate limit, or an unrecognized model as
+            // a well-formed envelope on stdout *and* exit 1, with stderr empty
+            // or holding only an internal code. Checking the status first
+            // would discard the only readable explanation.
+            if let Some(envelope) = response::find_envelope(&stdout_bytes) {
+                return envelope.into_completion_response();
+            }
 
-        // The envelope comes first, whatever the exit status. The CLI reports
-        // a usage limit, a rate limit, or an unrecognized model as a
-        // well-formed envelope on stdout *and* exit 1, with stderr empty or
-        // holding only an internal code. Checking the status first would
-        // discard the only readable explanation.
-        if let Some(envelope) = response::find_envelope(&stdout_bytes) {
-            return envelope.into_completion_response();
-        }
-
-        let stderr_text = stderr_drain.finish(STDERR_GRACE).await;
-        if status.success() {
+            let stderr_text = stderr_drain.finish(STDERR_GRACE).await;
+            if !status.success() {
+                return Err(CompletionError::ProviderError(format!(
+                    "`{binary}` exited with {status}: {}",
+                    response::quote(&stderr_text)
+                )));
+            }
+            if truncated {
+                // Without this the half-read buffer fails to parse and the
+                // error reads as a protocol break rather than a size limit.
+                return Err(CompletionError::ResponseError(format!(
+                    "claude produced more than {STDOUT_LIMIT} bytes of output, \
+                     which was truncated before it could be parsed"
+                )));
+            }
             Err(CompletionError::ResponseError(format!(
                 "unparseable claude output; received: {}",
                 response::quote(&stdout_bytes)
             )))
-        } else {
-            Err(CompletionError::ProviderError(format!(
-                "`{}` exited with {status}: {}",
-                self.binary,
-                response::quote(&stderr_text)
-            )))
+        };
+
+        // The deadline covers the whole turn, grace periods included, so
+        // `with_timeout` means what it says. Dropping `child` on that path
+        // kills it, because the spawn set `kill_on_drop`.
+        match self.timeout {
+            Some(limit) => tokio::time::timeout(limit, turn)
+                .await
+                .map_err(|_| timed_out(&self.binary, limit))?,
+            None => turn.await,
         }
     }
 
@@ -487,10 +545,47 @@ impl CompletionModel for ClaudeCodeModel {
 
             let mut lines = streaming::Lines::new(stdout);
             let mut saw_terminal_frame = false;
-            let deadline = timeout.map(|limit| tokio::time::Instant::now() + limit);
+            // The child's exit is the other way this loop can end. Waiting for
+            // end-of-file alone tracks whatever still holds the pipe open — an
+            // MCP server, a telemetry flush — so a CLI that dies without its
+            // terminal frame would never surface the failure.
+            let mut exit: Option<std::io::Result<std::process::ExitStatus>> = None;
+            let mut after_exit: Option<tokio::time::Instant> = None;
+            // `Instant + Duration` panics on overflow, so `with_timeout(Duration::MAX)`
+            // — a plausible way to spell "effectively none" — would panic here.
+            // A deadline that cannot be represented is no deadline, which is
+            // what the caller meant and what the blocking path already does.
+            let deadline = timeout.and_then(|limit| tokio::time::Instant::now().checked_add(limit));
 
             loop {
-                let line = match read_next(&mut lines, deadline).await {
+                // Once the child is gone, only what is already in the pipe can
+                // still arrive, so the read gets a short budget rather than the
+                // turn's.
+                let next_deadline = match after_exit {
+                    Some(at) => Some(deadline.map_or(at, |turn| turn.min(at))),
+                    None => deadline,
+                };
+
+                let read = if exit.is_some() {
+                    read_next(&mut lines, next_deadline).await
+                } else {
+                    tokio::select! {
+                        line = read_next(&mut lines, next_deadline) => line,
+                        status = child.wait() => {
+                            exit = Some(status);
+                            after_exit = tokio::time::Instant::now().checked_add(STDOUT_GRACE);
+                            continue;
+                        }
+                    }
+                };
+
+                let line = match read {
+                    Err(Deadline) if exit.is_some() => {
+                        // The child is gone and its output has stopped
+                        // arriving; whatever still holds the pipe open is not
+                        // going to add to this turn.
+                        break;
+                    }
                     Err(Deadline) => {
                         // Returning drops `child`, which kills it: the spawn
                         // set `kill_on_drop`.
@@ -541,11 +636,14 @@ impl CompletionModel for ClaudeCodeModel {
             // the loop broke, so a child that emitted its result and then took
             // its time exiting held the caller past the stated limit and then
             // reported success.
-            let waited = match deadline {
-                Some(at) => tokio::time::timeout_at(at, child.wait()).await.ok(),
-                None => Some(child.wait().await),
+            let status = match exit {
+                Some(status) => Some(status),
+                None => match deadline {
+                    Some(at) => tokio::time::timeout_at(at, child.wait()).await.ok(),
+                    None => Some(child.wait().await),
+                },
             };
-            let Some(status) = waited else {
+            let Some(status) = status else {
                 // Returning drops `child`, which kills it.
                 yield Err(timed_out(&program, timeout.unwrap_or_default()));
                 return;
@@ -555,28 +653,37 @@ impl CompletionModel for ClaudeCodeModel {
             }
             let stderr_text = stderr_drain.finish(STDERR_GRACE).await;
 
-            match status {
-                Ok(status) if !status.success() => {
-                    yield Err(CompletionError::ProviderError(format!(
-                        "`{program}` exited with {status}: {}",
-                        response::quote(&stderr_text)
-                    )));
-                }
-                Ok(_) if !saw_terminal_frame => {
-                    yield Err(CompletionError::ResponseError(format!(
-                        "`{program}` closed the stream without a terminal result frame"
-                    )));
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    yield Err(CompletionError::ProviderError(format!(
-                        "waiting for `{program}`: {error}"
-                    )));
-                }
+            if let Some(error) = conclude(&program, status, saw_terminal_frame, &stderr_text) {
+                yield Err(error);
             }
         };
 
         Ok(StreamingCompletionResponse::stream(Box::pin(frames)))
+    }
+}
+
+/// What a finished stream amounts to, once the child's status is known.
+///
+/// `None` is a clean turn. Everything else is the error item the stream ends
+/// with.
+fn conclude(
+    program: &str,
+    status: std::io::Result<std::process::ExitStatus>,
+    saw_terminal_frame: bool,
+    stderr_text: &[u8],
+) -> Option<CompletionError> {
+    match status {
+        Ok(status) if !status.success() => Some(CompletionError::ProviderError(format!(
+            "`{program}` exited with {status}: {}",
+            response::quote(stderr_text)
+        ))),
+        Ok(_) if !saw_terminal_frame => Some(CompletionError::ResponseError(format!(
+            "`{program}` closed the stream without a terminal result frame"
+        ))),
+        Ok(_) => None,
+        Err(error) => Some(CompletionError::ProviderError(format!(
+            "waiting for `{program}`: {error}"
+        ))),
     }
 }
 
@@ -603,6 +710,70 @@ where
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    fn exit_with(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt as _;
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    #[test]
+    fn a_clean_exit_with_a_terminal_frame_concludes_nothing() {
+        assert!(conclude("claude", Ok(exit_with(0)), true, b"").is_none());
+    }
+
+    #[test]
+    fn a_clean_exit_without_a_terminal_frame_is_reported() {
+        let error = conclude("claude", Ok(exit_with(0)), false, b"").unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("without a terminal result frame"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_failed_exit_quotes_stderr_whatever_the_frames_said() {
+        let error = conclude("claude", Ok(exit_with(3)), true, b"it broke").unwrap();
+        let rendered = error.to_string();
+        assert!(rendered.contains("exited with"), "{rendered}");
+        assert!(rendered.contains("it broke"), "{rendered}");
+    }
+
+    #[test]
+    fn a_wait_failure_is_reported() {
+        let failure = std::io::Error::other("no such process");
+        let error = conclude("claude", Err(failure), true, b"").unwrap();
+        assert!(
+            error.to_string().contains("waiting for `claude`"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_drain_records_that_it_truncated() {
+        let input = std::io::Cursor::new(vec![b'x'; 5000]);
+        let drain = Drain::start(input, 100);
+        let kept = {
+            let flag = Arc::clone(&drain.truncated);
+            let bytes = drain.finish(Duration::from_secs(5)).await;
+            assert!(
+                flag.load(Ordering::Relaxed),
+                "5000 bytes into 100 is a truncation"
+            );
+            bytes
+        };
+        assert_eq!(kept.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn a_drain_under_budget_does_not_claim_truncation() {
+        let input = std::io::Cursor::new(b"short".to_vec());
+        let drain = Drain::start(input, 100);
+        let flag = Arc::clone(&drain.truncated);
+        drain.finish(Duration::from_secs(5)).await;
+        assert!(!flag.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn require_pipe_passes_a_present_handle_through() {

@@ -146,6 +146,55 @@ async fn from_env_rejects_a_binary_that_runs_and_fails() {
     assert!(rendered.contains("not claude"), "{rendered}");
 }
 
+/// Every marker a live Claude Code session exports.
+const SESSION_MARKERS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_PID",
+    "CLAUDE_EFFORT",
+    "AI_AGENT",
+];
+
+#[tokio::test]
+async fn no_session_marker_reaches_the_child() {
+    // `CLAUDECODE` alone is not the family. A session also exports a messaging
+    // socket and token, a session id, and `CLAUDE_EFFORT` — which would
+    // silently change the effort level, and with it the cost, of every turn
+    // depending on who launched the host process. The markers are set here
+    // rather than inherited, so the test has teeth off a machine that happens
+    // to be running inside Claude Code.
+    let _guard = ENV_LOCK.lock().await;
+    let fake = FakeClaude::printing(envelope());
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    for marker in SESSION_MARKERS {
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var(marker, "set-by-the-test");
+        }
+    }
+    let result = model.completion(request()).await;
+    for marker in SESSION_MARKERS {
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var(marker);
+        }
+    }
+    result.unwrap();
+
+    let leaked: Vec<String> = fake
+        .child_env()
+        .into_iter()
+        .filter(|name| SESSION_MARKERS.contains(&name.as_str()))
+        .collect();
+    assert!(leaked.is_empty(), "leaked to the child: {leaked:?}");
+}
+
 #[tokio::test]
 async fn removes_the_nested_session_marker_from_a_turn() {
     let _guard = ENV_LOCK.lock().await;

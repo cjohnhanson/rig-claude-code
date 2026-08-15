@@ -8,10 +8,13 @@ license = "MIT"
 description = "Unofficial rig completion model backed by the Claude Code CLI, authenticated by a Claude subscription instead of an API key."
 repository = "https://github.com/cjohnhanson/rig-claude-code"
 documentation = "https://docs.rs/rig-claude-code"
-homepage = "https://github.com/cjohnhanson/rig-claude-code"
 readme = "README.md"
 keywords = ["rig", "claude", "llm", "agent", "anthropic"]
 categories = ["api-bindings", "asynchronous"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 async-stream = "0.3.6"
@@ -23,7 +26,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3.27.0"
 thiserror = "2"
-tokio = { version = "1", features = ["process", "io-util", "rt"] }
+# `time` is used directly for the turn deadlines. It reaches the build
+# through reqwest today, which is an accident of rig-core's dependency
+# graph rather than a guarantee.
+tokio = { version = "1", features = ["process", "io-util", "rt", "time", "macros"] }
 
 [dev-dependencies]
 futures = "0.3.34"

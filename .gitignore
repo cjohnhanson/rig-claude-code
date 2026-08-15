@@ -1,2 +1,6 @@
 target/
-Cargo.lock
+
+# Committed on purpose: every CI step runs `--locked`, so an untracked
+# lockfile would fail a fresh checkout, and pinning is what makes the CI
+# signal mean anything for a crate whose dependency ships breaking changes
+# most months.

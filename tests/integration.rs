@@ -435,6 +435,25 @@ async fn a_streaming_argument_vector_is_exactly_what_the_crate_intends() {
 }
 
 #[tokio::test]
+async fn output_over_the_cap_is_reported_as_a_size_limit() {
+    // Without the flag, the half-read buffer fails to parse and the error
+    // reads as a protocol break rather than a size limit.
+    let mut stdout = "x".repeat(17 * 1024 * 1024);
+    stdout.push('\n');
+    let fake = FakeClaude::printing(&stdout);
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let error = tokio::time::timeout(Duration::from_secs(60), model.completion(request("hi")))
+        .await
+        .expect("a capped read must not stall")
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("truncated"), "{error}");
+    assert!(error.contains("16777216"), "the limit is named: {error}");
+}
+
+#[tokio::test]
 async fn a_failed_turn_is_reported_from_its_envelope_not_its_exit_status() {
     // The CLI reports a usage limit, a rate limit, or an unrecognized model as
     // a well-formed envelope on stdout *and* exit 1, with stderr empty or
@@ -638,6 +657,32 @@ async fn from_val_builds_a_working_client() {
         .unwrap();
 
     assert_eq!(text_of(&response), "ok");
+}
+
+#[tokio::test]
+async fn an_agent_inherits_the_clients_settings() {
+    // `client.agent(..)` is the only construction route the README documents.
+    // A setting that stopped at the client would be unreachable from it.
+    let fake = FakeClaude::printing(&envelope("ok"));
+    let elsewhere = tempfile::tempdir().unwrap();
+    let client = ClaudeCodeClient::new(fake.path())
+        .with_mcp_config("/etc/mcp.json")
+        .with_current_dir(elsewhere.path().display().to_string())
+        .with_timeout(Duration::from_secs(30));
+
+    let agent = client.agent("haiku").build();
+    agent.prompt("hi").await.unwrap();
+
+    assert_eq!(
+        fake.value_after("--mcp-config").as_deref(),
+        Some("/etc/mcp.json")
+    );
+    let recorded = fake.working_dir().unwrap();
+    assert_eq!(
+        std::fs::canonicalize(&recorded).unwrap(),
+        std::fs::canonicalize(elsewhere.path()).unwrap(),
+        "{recorded}"
+    );
 }
 
 #[tokio::test]
@@ -1084,6 +1129,88 @@ async fn a_stream_survives_a_child_that_floods_stderr_first() {
 }
 
 #[tokio::test]
+async fn a_stream_reports_a_child_that_died_without_a_terminal_frame() {
+    // Waiting for end-of-file on stdout tracks whatever still holds the pipe
+    // open. The child's own exit has to end the loop too, or a CLI that dies
+    // before emitting its terminal frame never surfaces the failure — and with
+    // no timeout set, never returns at all.
+    let fake = FakeClaude::builder()
+        .stderr("boom")
+        .exit_code(2)
+        .orphan_for(Duration::from_secs(20))
+        .build();
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let started = std::time::Instant::now();
+    let stream = model.stream(request("hi")).await.unwrap();
+    let (_, _, failure) = tokio::time::timeout(Duration::from_secs(60), drain(stream))
+        .await
+        .expect("the child's exit must end the stream");
+
+    let failure = failure.expect("a non-zero exit must surface");
+    assert!(failure.contains("boom"), "{failure}");
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "waited {:?} for a grandchild that lives 20s",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_stream_with_a_timeout_still_ends_promptly_after_the_child_exits() {
+    // Both deadlines are live here: the turn's, and the shorter post-exit
+    // grace. The grace must win, or a grandchild holding the pipe would keep
+    // the stream open until the turn's deadline.
+    let fake = FakeClaude::builder()
+        .stderr("boom")
+        .exit_code(2)
+        .orphan_for(Duration::from_secs(20))
+        .build();
+    let model = ClaudeCodeModel::new("haiku")
+        .with_binary(fake.path())
+        .with_timeout(Duration::from_secs(50));
+
+    let started = std::time::Instant::now();
+    let stream = model.stream(request("hi")).await.unwrap();
+    let (_, _, failure) = tokio::time::timeout(Duration::from_secs(60), drain(stream))
+        .await
+        .expect("the child's exit must end the stream");
+
+    let failure = failure.expect("a non-zero exit must surface");
+    assert!(failure.contains("boom"), "{failure}");
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "waited {:?}; the post-exit grace did not bound the tail",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_timeout_too_large_to_represent_is_no_timeout_rather_than_a_panic() {
+    // `Instant + Duration` panics on overflow, and `Duration::MAX` is a
+    // plausible way to spell "effectively none".
+    let fake = FakeClaude::printing(&frame_stream("ok", ""));
+    let model = ClaudeCodeModel::new("haiku")
+        .with_binary(fake.path())
+        .with_timeout(Duration::MAX);
+
+    let stream = model.stream(request("hi")).await.unwrap();
+    let (text, _, failure) = drain(stream).await;
+
+    assert_eq!(failure, None);
+    assert_eq!(text, "ok");
+
+    let blocking = FakeClaude::printing(&envelope("ok"));
+    let model = ClaudeCodeModel::new("haiku")
+        .with_binary(blocking.path())
+        .with_timeout(Duration::MAX);
+    assert_eq!(
+        text_of(&model.completion(request("hi")).await.unwrap()),
+        "ok"
+    );
+}
+
+#[tokio::test]
 async fn a_stream_does_not_wait_for_a_grandchild_holding_the_pipes() {
     // Standard error reaches end-of-file only when every write end closes,
     // including a grandchild that inherited it. Waiting for that holds the
@@ -1187,8 +1314,8 @@ async fn threads_history_through_the_agent() {
     assert_eq!(answer, "second answer");
 
     let prompt = fake.stdin();
-    assert!(prompt.contains("user: first question"), "{prompt}");
-    assert!(prompt.contains("assistant: first answer"), "{prompt}");
+    assert!(prompt.contains(": first question"), "{prompt}");
+    assert!(prompt.contains(": first answer"), "{prompt}");
     assert!(prompt.ends_with("second question"), "{prompt}");
 }
 
