@@ -1517,6 +1517,71 @@ async fn a_streamed_turn_surfaces_the_calls_the_cli_made() {
 }
 
 #[tokio::test]
+async fn a_streamed_turn_that_made_calls_drops_its_text_from_history() {
+    // rig folds every yielded text delta into the committed history, and
+    // the text a model writes on a tool turn is about the placeholder it was
+    // handed: "Let me wait for the result...". Observed from the real CLI.
+    // The next turn would read that as its own past self. So on a turn that
+    // made calls, only the calls are yielded, exactly as the blocking path
+    // discards its text.
+    let fake = FakeClaude::builder()
+        .stdout(&frame_stream("Let me wait for the result...", ""))
+        .calls_mcp_tool("add", &serde_json::json!({"left": 4, "right": 5}))
+        .build();
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let mut req = request("add 4 and 5");
+    req.tools = vec![rig_core::completion::ToolDefinition {
+        name: "add".to_owned(),
+        description: "Add".to_owned(),
+        parameters: serde_json::json!({"type": "object"}),
+    }];
+    let mut stream = model.stream(req).await.unwrap();
+
+    let mut texts = Vec::new();
+    let mut calls = 0;
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(StreamedAssistantContent::Text(t)) => texts.push(t.text),
+            Ok(StreamedAssistantContent::ToolCall { .. }) => calls += 1,
+            _ => {}
+        }
+    }
+
+    assert_eq!(calls, 1);
+    assert!(
+        texts.is_empty(),
+        "placeholder-shaped text leaked: {texts:?}"
+    );
+    let committed: Vec<_> = stream.choice.iter().collect();
+    assert!(
+        committed
+            .iter()
+            .all(|c| matches!(c, AssistantContent::ToolCall(_))),
+        "history must hold the calls and nothing else: {committed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_streamed_tool_bearing_turn_with_no_calls_still_delivers_its_text() {
+    // Holding text back must not lose it when the model simply answers.
+    let fake = FakeClaude::printing(&frame_stream("Four.", ""));
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let mut req = request("what is 2 and 2?");
+    req.tools = vec![rig_core::completion::ToolDefinition {
+        name: "add".to_owned(),
+        description: "Add".to_owned(),
+        parameters: serde_json::json!({"type": "object"}),
+    }];
+    let stream = model.stream(req).await.unwrap();
+    let (text, _, failure) = drain(stream).await;
+
+    assert_eq!(failure, None);
+    assert_eq!(text, "Four.");
+}
+
+#[tokio::test]
 async fn two_calls_in_one_turn_both_come_back_in_order() {
     let fake = FakeClaude::builder()
         .stdout(&envelope("done"))

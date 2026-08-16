@@ -609,6 +609,16 @@ impl CompletionModel for ClaudeCodeModel {
             // the turn ends.
             let bridge = bridge;
             let mut stopped_early = false;
+            // On a turn that advertises tools, text is held back until the
+            // terminal frame says whether the CLI made any calls. rig folds
+            // every yielded text delta into the committed history, and the
+            // text a model writes after the placeholder is about the
+            // placeholder ("Let me wait for the result..."), which the next
+            // turn would then read as its own past self. The blocking path
+            // discards that text; this path must too, and it can only decide
+            // once the calls are known.
+            let mut held: Vec<RawStreamingChoice<CliResponse>> = Vec::new();
+            let holding = bridge.is_some();
 
             let mut lines = streaming::Lines::new(stdout);
             let mut saw_terminal_frame = false;
@@ -679,10 +689,11 @@ impl CompletionModel for ClaudeCodeModel {
                 };
 
                 match streaming::classify(&line) {
+                    streaming::Event::Emit(choice) if holding => held.push(choice),
                     streaming::Event::Emit(choice) => yield Ok(choice),
                     streaming::Event::Finish(result) => {
                         saw_terminal_frame = true;
-                        for choice in finish_items(bridge.as_ref(), *result) {
+                        for choice in finish_items(bridge.as_ref(), std::mem::take(&mut held), *result) {
                             yield Ok(choice);
                         }
                         // The terminal frame ends the turn. Reading on to
@@ -707,18 +718,14 @@ impl CompletionModel for ClaudeCodeModel {
             // `write` forever, and `child.wait()` never returns.
             let tail = stopped_early.then(|| Drain::start(lines.into_reader(), 0));
 
-            // The deadline covers the tail too. It used to stop applying once
-            // the loop broke, so a child that emitted its result and then took
-            // its time exiting held the caller past the stated limit and then
-            // reported success.
-            let status = match exit {
-                Some(status) => Some(status),
-                None => match deadline {
-                    Some(at) => tokio::time::timeout_at(at, child.wait()).await.ok(),
-                    None => Some(child.wait().await),
-                },
-            };
-            let Some(status) = status else {
+            // End of output with no terminal frame: release whatever was
+            // held so the caller at least sees it. (With a terminal frame,
+            // `finish_items` already drained it.)
+            for choice in std::mem::take(&mut held) {
+                yield Ok(choice);
+            }
+
+            let Some(status) = await_exit(exit, &mut child, deadline).await else {
                 // Returning drops `child`, which kills it.
                 yield Err(timed_out(&program, timeout.unwrap_or_default()));
                 return;
@@ -824,25 +831,50 @@ fn conclude(
     }
 }
 
+/// The child's exit status, waited for under the turn's deadline.
+///
+/// `exit` is already known when the child's exit ended the read loop. The
+/// deadline covers this wait too. It used to stop applying once the loop
+/// broke, so a child that emitted its result and then took its time exiting
+/// held the caller past the stated limit and then reported success.
+async fn await_exit(
+    exit: Option<std::io::Result<std::process::ExitStatus>>,
+    child: &mut Child,
+    deadline: Option<tokio::time::Instant>,
+) -> Option<std::io::Result<std::process::ExitStatus>> {
+    match exit {
+        Some(status) => Some(status),
+        None => match deadline {
+            Some(at) => tokio::time::timeout_at(at, child.wait()).await.ok(),
+            None => Some(child.wait().await),
+        },
+    }
+}
+
 /// The items a stream yields when its terminal frame arrives.
 ///
-/// The session id, then every tool call the CLI made, then the final
-/// response. Text deltas already went out and cannot be retracted the way
-/// the blocking path discards its text; what rig's runner needs to decide it
-/// must run tools is the calls themselves, so they go out ahead of the final
-/// response.
+/// The session id first. Then, if the CLI made tool calls, the calls and
+/// nothing else: text the model wrote on that turn is dropped, as the
+/// blocking path drops it, because it was written against the placeholder.
+/// Otherwise the held text, in order. The final response last either way.
 fn finish_items(
     bridge: Option<&Bridge>,
+    held: Vec<RawStreamingChoice<CliResponse>>,
     result: CliResponse,
 ) -> Vec<RawStreamingChoice<CliResponse>> {
     let mut items = Vec::new();
     if let Some(id) = result.session_id.clone() {
         items.push(RawStreamingChoice::MessageId(id));
     }
-    if let Some(bridge) = bridge {
-        for call in bridge.take_calls() {
-            items.push(RawStreamingChoice::ToolCall(call.into_raw()));
-        }
+    let calls = bridge.map(Bridge::take_calls).unwrap_or_default();
+    if calls.is_empty() {
+        items.extend(held);
+    } else {
+        items.extend(
+            calls
+                .into_iter()
+                .map(|call| RawStreamingChoice::ToolCall(call.into_raw())),
+        );
     }
     items.push(RawStreamingChoice::FinalResponse(result));
     items
