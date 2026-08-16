@@ -45,7 +45,9 @@
 //! the CLI is only the model. For each turn that carries tools the crate
 //! serves them to the CLI over a per-turn loopback MCP server, records the
 //! calls the CLI makes, and returns them as `AssistantContent::ToolCall` for
-//! rig's runner to execute. Set `default_max_turns` to at least two.
+//! rig's runner to execute. The server accepts only requests that carry the
+//! turn's random bearer token, so another local process cannot inject a call.
+//! Set `default_max_turns` to at least two.
 //!
 //! # What the transport does not do
 //!

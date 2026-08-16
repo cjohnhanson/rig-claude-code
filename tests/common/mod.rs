@@ -476,6 +476,8 @@ if [ -n "${{CLAUDECODE+set}}" ]; then echo present > "$here/nested"; else echo a
 ///
 /// Streamable HTTP MCP needs an `initialize` round trip before a
 /// `tools/call`; the session id comes back in a header and must be echoed.
+/// The `Authorization` header from the config goes on every request, as the
+/// real CLI forwards `headers` from an http server entry.
 /// Everything here is POST-and-parse with curl and sed, so the fake stays a
 /// plain shell script. Empty when there is nothing to call.
 fn mcp_script(calls: &[(String, String)]) -> String {
@@ -486,12 +488,13 @@ fn mcp_script(calls: &[(String, String)]) -> String {
     }
     let mut script = String::from(
         r#"url=$(printf '%s\n' "$mcp_config" | sed -n 's/.*"url":"\([^"]*\)".*/\1/p')
+auth=$(printf '%s\n' "$mcp_config" | sed -n 's/.*"Authorization":"\([^"]*\)".*/\1/p')
 if [ -n "$url" ] && [ -n "$first_spawn" ]; then
   hdrs=$(mktemp)
-  curl -s -D "$hdrs" -o /dev/null -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  curl -s -D "$hdrs" -o /dev/null -H "Authorization: $auth" -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fake-claude","version":"0"}}}' "$url"
   sid=$(sed -n 's/^[Mm]cp-[Ss]ession-[Ii]d: *//p' "$hdrs" | tr -d '\r')
-  curl -s -o /dev/null -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -H "Mcp-Session-Id: $sid" \
+  curl -s -o /dev/null -H "Authorization: $auth" -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -H "Mcp-Session-Id: $sid" \
     -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' "$url"
 "#,
     );
@@ -504,7 +507,7 @@ if [ -n "$url" ] && [ -n "$first_spawn" ]; then
         let quoted = body.replace('\'', "'\\''");
         let _ = writeln!(
             script,
-            "  curl -s -o \"$here/mcp_reply_{i}\" -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -H \"Mcp-Session-Id: $sid\" -d '{quoted}' \"$url\""
+            "  curl -s -o \"$here/mcp_reply_{i}\" -H \"Authorization: $auth\" -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -H \"Mcp-Session-Id: $sid\" -d '{quoted}' \"$url\""
         );
     }
     script.push_str("fi\n");

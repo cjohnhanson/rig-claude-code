@@ -5217,9 +5217,14 @@ name = "rig-claude-code"
 version = "0.1.0"
 dependencies = [
  "async-stream",
+ "bytes",
  "futures",
+ "getrandom 0.3.4",
+ "http",
+ "http-body-util",
  "hyper",
  "hyper-util",
+ "reqwest 0.13.4",
  "rig",
  "rig-core",
  "rmcp",

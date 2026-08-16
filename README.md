@@ -269,7 +269,11 @@ The consequences for a caller:
 
 - Tools run in your process, with rig's hooks and permissions, exactly as with
   any other provider.
-- Each turn that carries tools opens a loopback port for its duration.
+- Each turn that carries tools opens a loopback port for its duration. Every
+  local process can reach that port, so the crate mints a random bearer token
+  per turn, hands it to the CLI in the MCP configuration, and answers `401` to
+  any request without it. A recorded call therefore came from this turn's CLI
+  and not from another process on the machine.
 - The model's text on a turn that made calls is discarded, since it was
   written before any result existed. rig's runner asks again.
 - `tool_choice` `Auto` and `None` are honored. `Required` and `Specific` are

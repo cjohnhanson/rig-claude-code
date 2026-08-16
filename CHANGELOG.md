@@ -84,5 +84,12 @@ The public surface, in full:
   messaging token and `CLAUDE_EFFORT`, which would silently change the effort
   and cost of every turn. Variables that select the credential, such as
   `CLAUDE_CONFIG_DIR` and `ANTHROPIC_API_KEY`, are left alone on purpose.
+- The per-turn tool bridge requires a bearer token. The bridge listens on
+  loopback, which every local process can reach, and its port is visible in
+  the CLI's argument vector. Without a token any local process could post a
+  `tools/call` that the crate would record, return as a `ToolCall`, and let
+  rig execute with the stranger's arguments. Each turn mints 256 random bits
+  from the OS, passes them to the CLI as an `Authorization` header in the MCP
+  configuration, and answers `401` to any request that does not present them.
 
 [Unreleased]: https://github.com/cjohnhanson/rig-claude-code

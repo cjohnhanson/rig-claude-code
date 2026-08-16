@@ -18,6 +18,10 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 async-stream = "0.3.6"
+bytes = "1"
+getrandom = "0.3"
+http = "1"
+http-body-util = "0.1"
 hyper = "1"
 hyper-util = { version = "0.1.20", features = ["service", "server", "server-auto", "tokio", "http1"] }
 # No default features: this crate makes no HTTP requests and uses no derive
@@ -37,6 +41,7 @@ tower-service = "0.3"
 
 [dev-dependencies]
 futures = "0.3.34"
+reqwest = "0.13"
 rig = "0.41"
 # No default features: this crate makes no HTTP requests and uses no derive
 # macros, so it must not pin a TLS backend for applications that wanted a

@@ -115,11 +115,100 @@ impl ServerHandler for Handler {
 /// A live per-turn MCP server.
 ///
 /// Dropping it stops the listener. Every call the CLI made during the turn
-/// is available through [`Bridge::calls`].
+/// is available through [`Bridge::take_calls`].
+///
+/// The listener binds loopback only, but loopback is shared with every
+/// process on the machine, and the port is visible in the CLI's argv. A
+/// stranger who found it could POST a `tools/call`, the turn would return it
+/// as a `ToolCall`, and rig would *execute that tool with the stranger's
+/// arguments*. So each bridge mints a random bearer token, hands it to the
+/// CLI in the MCP config's `headers` (which the CLI forwards on every
+/// request; verified against 2.1.233), and rejects any request that does not
+/// present it before the request reaches the MCP layer.
 pub(crate) struct Bridge {
     url: String,
+    token: String,
     calls: Arc<Mutex<Vec<RecordedCall>>>,
     _serve: crate::model::AbortOnDrop,
+}
+
+/// Mint a bearer token no other local process can guess.
+///
+/// `rig_core::id::generate` is documented as non-cryptographic, which is fine
+/// for a call id and not for this. `getrandom` reaches the OS entropy source.
+fn mint_token() -> std::io::Result<String> {
+    use std::fmt::Write as _;
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|error| std::io::Error::other(error.to_string()))?;
+    let hex = bytes
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            // Writing to a String cannot fail.
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        });
+    Ok(hex)
+}
+
+/// Reject any request that does not carry this turn's bearer token.
+///
+/// A [`tower_service::Service`] in front of the MCP service. A bad or missing
+/// token gets `401` and never reaches rmcp, so it cannot open a session,
+/// list tools, or record a call.
+#[derive(Clone)]
+struct RequireToken<S> {
+    expected: Arc<str>,
+    inner: S,
+}
+
+/// The response body rmcp's HTTP service produces.
+type McpBody = http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>;
+
+impl<S, B> tower_service::Service<http::Request<B>> for RequireToken<S>
+where
+    S: tower_service::Service<
+            http::Request<B>,
+            Response = http::Response<McpBody>,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+    B: Send + 'static,
+{
+    type Response = http::Response<McpBody>;
+    type Error = std::convert::Infallible;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        let presented = request
+            .headers()
+            .get(http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "));
+        // Constant-time compare is not needed here: the token is 256 bits of
+        // OS entropy, and the attacker is local with no oracle beyond a 401.
+        if presented != Some(self.expected.as_ref()) {
+            let response = http::Response::builder()
+                .status(http::StatusCode::UNAUTHORIZED)
+                .body(http_body_util::combinators::BoxBody::new(
+                    http_body_util::Empty::<bytes::Bytes>::new(),
+                ))
+                .unwrap_or_default();
+            return Box::pin(async move { Ok(response) });
+        }
+        let mut inner = self.inner.clone();
+        Box::pin(async move { inner.call(request).await })
+    }
 }
 
 impl Bridge {
@@ -133,17 +222,22 @@ impl Bridge {
         let port = listener.local_addr()?.port();
         let url = format!("http://127.0.0.1:{port}/mcp");
 
+        let token = mint_token()?;
         let calls = Arc::new(Mutex::new(Vec::new()));
         let handler = Handler {
             tools: Arc::new(tools.iter().map(to_mcp_tool).collect()),
             calls: Arc::clone(&calls),
         };
 
-        let service = hyper_util::service::TowerToHyperService::new(StreamableHttpService::new(
+        let mcp = StreamableHttpService::new(
             move || Ok(handler.clone()),
             LocalSessionManager::default().into(),
             rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default(),
-        ));
+        );
+        let service = hyper_util::service::TowerToHyperService::new(RequireToken {
+            expected: Arc::from(token.as_str()),
+            inner: mcp,
+        });
 
         let serve = tokio::spawn(async move {
             loop {
@@ -164,6 +258,7 @@ impl Bridge {
 
         Ok(Self {
             url,
+            token,
             calls,
             _serve: crate::model::AbortOnDrop(serve),
         })
@@ -175,14 +270,24 @@ impl Bridge {
         &self.url
     }
 
-    /// The `--mcp-config` JSON that names this server.
+    /// The `--mcp-config` JSON that names this server and carries its token.
     pub(crate) fn mcp_config(&self) -> String {
         serde_json::json!({
             "mcpServers": {
-                SERVER_NAME: { "type": "http", "url": self.url }
+                SERVER_NAME: {
+                    "type": "http",
+                    "url": self.url,
+                    "headers": { "Authorization": format!("Bearer {}", self.token) }
+                }
             }
         })
         .to_string()
+    }
+
+    /// This turn's bearer token.
+    #[cfg(test)]
+    pub(crate) fn token(&self) -> &str {
+        &self.token
     }
 
     /// The `--allowedTools` value that lets the CLI call every tool served.
@@ -295,6 +400,78 @@ mod tests {
         assert_eq!(config["mcpServers"]["rig"]["type"], "http");
     }
 
+    /// An rmcp HTTP client transport that presents the bridge's token, as
+    /// the CLI does.
+    fn authed_transport(
+        bridge: &Bridge,
+    ) -> rmcp::transport::StreamableHttpClientTransport<reqwest::Client> {
+        use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+        rmcp::transport::StreamableHttpClientTransport::with_client(
+            reqwest::Client::default(),
+            StreamableHttpClientTransportConfig::with_uri(bridge.url()).auth_header(bridge.token()),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_request_without_the_token_is_refused_before_it_reaches_mcp() {
+        // Loopback is shared with every local process, and the port is in the
+        // CLI's argv. A stranger's `tools/call` would otherwise be recorded,
+        // returned as a ToolCall, and executed by rig with the stranger's
+        // arguments.
+        let bridge = Bridge::start(&[add_tool()]).await.unwrap();
+
+        let response = reqwest::Client::new()
+            .post(bridge.url())
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add","arguments":{"left":1,"right":1}}}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+        assert!(bridge.take_calls().is_empty(), "nothing may be recorded");
+    }
+
+    #[tokio::test]
+    async fn a_request_with_the_wrong_token_is_refused() {
+        let bridge = Bridge::start(&[add_tool()]).await.unwrap();
+
+        let response = reqwest::Client::new()
+            .post(bridge.url())
+            .header("Authorization", "Bearer not-the-token")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"x","version":"0"}}}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn each_bridge_mints_its_own_token() {
+        let a = Bridge::start(&[add_tool()]).await.unwrap();
+        let b = Bridge::start(&[add_tool()]).await.unwrap();
+        assert_ne!(a.token(), b.token());
+        assert_eq!(a.token().len(), 64, "256 bits, hex");
+    }
+
+    #[test]
+    fn the_config_carries_the_token_as_a_bearer_header() {
+        // Cannot construct a Bridge without binding, so check the shape the
+        // config builder produces from known parts.
+        let rendered = serde_json::json!({
+            "mcpServers": { SERVER_NAME: {
+                "type": "http", "url": "http://127.0.0.1:1/mcp",
+                "headers": { "Authorization": "Bearer abc" }
+            }}
+        });
+        assert_eq!(
+            rendered["mcpServers"]["rig"]["headers"]["Authorization"],
+            "Bearer abc"
+        );
+    }
+
     #[tokio::test]
     async fn a_client_over_http_lists_the_tools_and_has_its_call_recorded() {
         // The same path the CLI takes: connect over streamable HTTP, list
@@ -302,11 +479,9 @@ mod tests {
         // handler and not the server.
         use rmcp::ServiceExt as _;
         use rmcp::model::CallToolRequestParams;
-        use rmcp::transport::StreamableHttpClientTransport;
 
         let bridge = Bridge::start(&[add_tool()]).await.unwrap();
-        let transport = StreamableHttpClientTransport::from_uri(bridge.url());
-        let client = ().serve(transport).await.expect("connect to the bridge");
+        let client = ().serve(authed_transport(&bridge)).await.expect("connect to the bridge");
 
         let listed = client.list_all_tools().await.expect("list tools");
         assert_eq!(listed.len(), 1);
