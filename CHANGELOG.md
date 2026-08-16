@@ -96,7 +96,10 @@ The public surface, in full:
   the CLI's argument vector. Without a token any local process could post a
   `tools/call` that the crate would record, return as a `ToolCall`, and let
   rig execute with the stranger's arguments. Each turn mints 256 random bits
-  from the OS, passes them to the CLI as an `Authorization` header in the MCP
-  configuration, and answers `401` to any request that does not present them.
+  from the OS, writes them as an `Authorization` header into a 0600 file the
+  CLI reads as its MCP configuration, and answers `401` to any request that
+  does not present them. The configuration goes through a file and not
+  inline in `--mcp-config` because argv is readable through `ps` by the same
+  local processes the token keeps out.
 
 [Unreleased]: https://github.com/cjohnhanson/rig-claude-code

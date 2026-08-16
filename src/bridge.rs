@@ -278,6 +278,9 @@ impl Bridge {
     }
 
     /// The `--mcp-config` JSON that names this server and carries its token.
+    ///
+    /// The model writes this to a private file and passes the path, so the
+    /// token never appears in the child's argument vector.
     pub(crate) fn mcp_config(&self) -> String {
         serde_json::json!({
             "mcpServers": {

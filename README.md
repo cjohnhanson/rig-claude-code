@@ -271,9 +271,11 @@ The consequences for a caller:
   any other provider.
 - Each turn that carries tools opens a loopback port for its duration. Every
   local process can reach that port, so the crate mints a random bearer token
-  per turn, hands it to the CLI in the MCP configuration, and answers `401` to
-  any request without it. A recorded call therefore came from this turn's CLI
-  and not from another process on the machine.
+  per turn, hands it to the CLI in a 0600 file it reads as its MCP
+  configuration, and answers `401` to any request without it. The token is
+  not in the child's argument vector, so `ps` does not show it. A recorded
+  call therefore came from a process that could read this user's files, in
+  practice this turn's CLI.
 - The model's text on a turn that made calls is discarded, since it was
   written before any result existed. rig's runner asks again.
 - `tool_choice` `Auto` and `None` are honored. `Required` and `Specific` are
@@ -286,7 +288,9 @@ The consequences for a caller:
   turns that silent failure into a loud one before any usage is spent.
 
 `with_mcp_config` still passes an MCP server of your own to the CLI, and its
-tools run inside the CLI as before. The two mechanisms coexist.
+tools run inside the CLI as before. The two mechanisms coexist. The crate's
+own server is named `rig`; a server of that name in your configuration is
+shadowed on any turn that carries rig tools.
 
 ## Handle a failed turn
 

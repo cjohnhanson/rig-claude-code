@@ -115,7 +115,10 @@ impl ClaudeCodeClient {
         self
     }
 
-    /// Give the CLI an MCP server configuration on every turn.
+    /// Give the CLI an MCP server configuration of your own, on every turn.
+    ///
+    /// See [`ClaudeCodeModel::with_mcp_config`] for what the CLI does with it
+    /// and for the reserved server name `rig`.
     #[must_use]
     pub fn with_mcp_config(self, path: impl Into<String>) -> Self {
         self.with_args(["--mcp-config".to_owned(), path.into()])

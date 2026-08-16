@@ -164,6 +164,20 @@ impl FakeClaude {
         u32::from_str_radix(recorded.trim(), 8).ok()
     }
 
+    /// The contents of the file named by `--mcp-config`, if it was a file.
+    ///
+    /// Copied by the script while the child is alive, as with
+    /// [`FakeClaude::system_prompt`].
+    pub fn mcp_config(&self) -> Option<String> {
+        self.read("mcp_config")
+    }
+
+    /// The permission bits of the file named by `--mcp-config`.
+    pub fn mcp_config_mode(&self) -> Option<u32> {
+        let recorded = self.read("mcp_config_mode")?;
+        u32::from_str_radix(recorded.trim(), 8).ok()
+    }
+
     /// How many times the fake has been invoked.
     pub fn spawn_count(&self) -> usize {
         self.read("spawns").map_or(0, |text| text.trim().len())
@@ -442,9 +456,7 @@ env > "$here/env"
 mcp_config=
 next_is_mcp=
 for a in "$@"; do
-  if [ -n "$next_is_mcp" ]; then mcp_config="$a"; next_is_mcp=; fi
-  if [ "$a" = "--mcp-config" ]; then next_is_mcp=1; fi
-  if [ -n "$next_is_sp" ]; then
+{mcp_config_scan}  if [ -n "$next_is_sp" ]; then
     {system_prompt_wait}cp "$a" "$here/system_prompt" 2>/dev/null
     # GNU stat and BSD stat disagree on every flag. Try the GNU spelling
     # first, and only if it prints nothing fall back to BSD.
@@ -458,7 +470,8 @@ done
 if [ -n "${{CLAUDECODE+set}}" ]; then echo present > "$here/nested"; else echo absent > "$here/nested"; fi
 {orphan}{sleep_before}{mcp}{first}{second}{sleep_after}{sentinel}exit {code}
 "#,
-            code = self.exit_code
+            code = self.exit_code,
+            mcp_config_scan = MCP_CONFIG_SCAN,
         );
 
         let binary = path.join("claude");
@@ -480,6 +493,27 @@ if [ -n "${{CLAUDECODE+set}}" ]; then echo present > "$here/nested"; else echo a
 /// real CLI forwards `headers` from an http server entry.
 /// Everything here is POST-and-parse with curl and sed, so the fake stays a
 /// plain shell script. Empty when there is nothing to call.
+/// The part of the fake's argv loop that captures `--mcp-config`.
+///
+/// The crate passes its bridge configuration as a file path; a caller's own
+/// configuration may be inline JSON or a path that does not exist here. A
+/// file is copied out while the child is alive, with its mode, as the system
+/// prompt is.
+const MCP_CONFIG_SCAN: &str = r#"  if [ -n "$next_is_mcp" ]; then
+    if [ -f "$a" ]; then
+      mcp_config=$(cat "$a")
+      cp "$a" "$here/mcp_config" 2>/dev/null
+      mode=$(stat -c '%a' "$a" 2>/dev/null)
+      [ -n "$mode" ] || mode=$(stat -f '%Lp' "$a" 2>/dev/null)
+      printf '%s\n' "$mode" > "$here/mcp_config_mode"
+    else
+      mcp_config="$a"
+    fi
+    next_is_mcp=
+  fi
+  if [ "$a" = "--mcp-config" ]; then next_is_mcp=1; fi
+"#;
+
 fn mcp_script(calls: &[(String, String)]) -> String {
     use std::fmt::Write as _;
 

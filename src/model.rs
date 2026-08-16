@@ -325,11 +325,14 @@ impl ClaudeCodeModel {
         self
     }
 
-    /// Give the CLI an MCP server configuration, which is its route to tools.
+    /// Give the CLI an MCP server configuration of your own.
     ///
     /// Equivalent to [`ClaudeCodeModel::with_args`] with `--mcp-config` and the
-    /// path. The tools stay under the CLI's control: rig never sees them, and
-    /// registering a rig tool on the agent still fails.
+    /// path. The tools in it run inside the CLI: rig never sees them. rig
+    /// tools registered on the agent work alongside them, through the
+    /// crate's own per-turn server. That server is named `rig`, so a server
+    /// of that name in your configuration is shadowed on any turn that
+    /// carries rig tools.
     #[must_use]
     pub fn with_mcp_config(self, path: impl Into<String>) -> Self {
         self.with_args(["--mcp-config".to_owned(), path.into()])
@@ -420,8 +423,9 @@ impl ClaudeCodeModel {
 
     /// Start the child described by `spec`.
     ///
-    /// Returns the child, the task feeding it the prompt, and the temporary
-    /// file holding the system prompt, which must outlive the child.
+    /// Returns the child, the task feeding it the prompt, and the private
+    /// files the child reads (the system prompt, the tool bridge's
+    /// configuration), which must outlive the child.
     ///
     /// The prompt is written on a separate task. Writing it inline before
     /// reading stdout is a deadlock: a prompt larger than the pipe buffer
@@ -433,8 +437,10 @@ impl ClaudeCodeModel {
         &self,
         spec: &CommandSpec,
         bridge: Option<&Bridge>,
-    ) -> Result<(Child, AbortOnDrop, Option<tempfile::NamedTempFile>), CompletionError> {
+    ) -> Result<(Child, AbortOnDrop, Vec<tempfile::NamedTempFile>), CompletionError> {
         self.check_extra_args()?;
+
+        let mut private_files = Vec::new();
 
         // The system prompt goes in a private file rather than argv: the CLI
         // scans raw argv for `--settings=` ahead of its own option parsing, so
@@ -443,6 +449,15 @@ impl ClaudeCodeModel {
             .system_prompt
             .as_deref()
             .map(write_private_file)
+            .transpose()?;
+
+        // The bridge's configuration carries the turn's bearer token. In argv
+        // it would be readable through `ps` by any local process, which is
+        // exactly the process the token exists to keep out. The CLI reads
+        // `--mcp-config` from a file path as well as inline JSON, and
+        // forwards `headers` from either (verified against 2.1.233).
+        let bridge_file = bridge
+            .map(|bridge| write_private_file(&bridge.mcp_config()))
             .transpose()?;
 
         let mut command = Command::new(&self.binary);
@@ -454,17 +469,19 @@ impl ClaudeCodeModel {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         strip_session_markers(&mut command);
-        if let Some(file) = &system_file {
+        if let Some(file) = system_file {
             command
                 .arg("--system-prompt-file")
                 .arg(file.path().as_os_str());
+            private_files.push(file);
         }
-        if let Some(bridge) = bridge {
+        if let Some(file) = bridge_file {
             command
                 .arg("--mcp-config")
-                .arg(bridge.mcp_config())
+                .arg(file.path().as_os_str())
                 .arg("--allowedTools")
                 .arg(Bridge::allowed_tools());
+            private_files.push(file);
         }
         if let Some(dir) = &self.current_dir {
             command.current_dir(dir);
@@ -485,7 +502,7 @@ impl ClaudeCodeModel {
             let _ = stdin.shutdown().await;
         });
 
-        Ok((child, AbortOnDrop(feed), system_file))
+        Ok((child, AbortOnDrop(feed), private_files))
     }
 }
 
@@ -504,7 +521,7 @@ impl CompletionModel for ClaudeCodeModel {
     ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
         let spec = request::build(&self.model, &request, request::Mode::Blocking)?;
         let bridge = self.start_bridge(&request).await?;
-        let (mut child, feed, _system_file) = self.spawn_child(&spec, bridge.as_ref())?;
+        let (mut child, feed, _private_files) = self.spawn_child(&spec, bridge.as_ref())?;
 
         let stdout = require_pipe(child.stdout.take(), "stdout")?;
         let stderr = require_pipe(child.stderr.take(), "stderr")?;
@@ -588,7 +605,7 @@ impl CompletionModel for ClaudeCodeModel {
     ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
         let spec = request::build(&self.model, &request, request::Mode::Streaming)?;
         let bridge = self.start_bridge(&request).await?;
-        let (mut child, feed, system_file) = self.spawn_child(&spec, bridge.as_ref())?;
+        let (mut child, feed, private_files) = self.spawn_child(&spec, bridge.as_ref())?;
 
         let stdout = require_pipe(child.stdout.take(), "stdout")?;
         let stderr = require_pipe(child.stderr.take(), "stderr")?;
@@ -597,10 +614,10 @@ impl CompletionModel for ClaudeCodeModel {
         let program = self.binary.clone();
         let timeout = self.timeout;
         let frames = async_stream::stream! {
-            // Both are held for the whole stream: the temporary file must
-            // outlive the child that reads it, and the feed task must not be
-            // cancelled before the prompt is written.
-            let _system_file = system_file;
+            // Both are held for the whole stream: the private files must
+            // outlive the child that reads them, and the feed task must not
+            // be cancelled before the prompt is written.
+            let _private_files = private_files;
             let _feed = feed;
             // Held for the whole stream so the CLI can reach the bridge until
             // the turn ends.

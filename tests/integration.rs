@@ -1485,6 +1485,77 @@ async fn a_tool_call_from_the_cli_comes_back_as_a_rig_tool_call() {
 }
 
 #[tokio::test]
+async fn a_callers_mcp_config_and_the_bridge_both_reach_the_cli_with_the_bridge_last() {
+    // The CLI takes several --mcp-config values, and when two configurations
+    // name the same server the later one wins. The bridge's server is named
+    // `rig`; appending it last is what lets rig tools work beside a caller's
+    // own configuration, so the order is pinned here.
+    let fake = FakeClaude::builder()
+        .stdout(&envelope("I called the tool."))
+        .calls_mcp_tool("add", &serde_json::json!({"left": 2, "right": 3}))
+        .build();
+    let model = ClaudeCodeModel::new("haiku")
+        .with_binary(fake.path())
+        .with_mcp_config("/etc/mcp.json");
+
+    let mut req = request("add 2 and 3");
+    req.tools = vec![rig_core::completion::ToolDefinition {
+        name: "add".to_owned(),
+        description: "Add two integers".to_owned(),
+        parameters: serde_json::json!({ "type": "object" }),
+    }];
+    model.completion(req).await.unwrap();
+
+    let argv = fake.argv();
+    let configs: Vec<&String> = argv
+        .iter()
+        .enumerate()
+        .filter(|(_, arg)| *arg == "--mcp-config")
+        .filter_map(|(i, _)| argv.get(i + 1))
+        .collect();
+    assert_eq!(configs.len(), 2, "{argv:?}");
+    assert_eq!(configs[0], "/etc/mcp.json");
+    assert!(
+        std::path::Path::new(configs[1]).is_absolute() && configs[1] != "/etc/mcp.json",
+        "the bridge's file comes last: {argv:?}"
+    );
+    assert!(fake.mcp_reply(0).is_some(), "the bridge was reached");
+}
+
+#[tokio::test]
+async fn the_bridge_token_travels_in_a_private_file_not_in_argv() {
+    // The token keeps other local processes off the bridge. In argv it would
+    // be readable through `ps` by exactly those processes.
+    let fake = FakeClaude::builder()
+        .stdout(&envelope("I called the tool."))
+        .calls_mcp_tool("add", &serde_json::json!({"left": 2, "right": 3}))
+        .build();
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+
+    let mut req = request("add 2 and 3");
+    req.tools = vec![rig_core::completion::ToolDefinition {
+        name: "add".to_owned(),
+        description: "Add two integers".to_owned(),
+        parameters: serde_json::json!({ "type": "object" }),
+    }];
+    model.completion(req).await.unwrap();
+
+    let config = fake
+        .mcp_config()
+        .expect("the bridge configuration is a file the CLI reads");
+    assert!(config.contains("\"Authorization\""), "{config}");
+    assert!(config.contains("Bearer "), "{config}");
+    assert_eq!(fake.mcp_config_mode(), Some(0o600));
+    assert!(
+        !fake.argv().iter().any(|arg| arg.contains("Bearer")),
+        "the token must not be in argv: {:?}",
+        fake.argv()
+    );
+    // And the fake reached the bridge with the token from the file.
+    assert!(fake.mcp_reply(0).is_some(), "the call was recorded");
+}
+
+#[tokio::test]
 async fn a_streamed_turn_surfaces_the_calls_the_cli_made() {
     // The streaming path started the bridge and never read its calls, so a
     // streamed turn with tools advertised them, let the CLI call them, and
