@@ -47,7 +47,9 @@
 //! calls the CLI makes, and returns them as `AssistantContent::ToolCall` for
 //! rig's runner to execute. The server accepts only requests that carry the
 //! turn's random bearer token, so another local process cannot inject a call.
-//! Set `default_max_turns` to at least two.
+//! Set `default_max_turns` to at least two. A tool whose `parameters` do not
+//! fit the MCP tool shape is refused before the turn runs; the cause is an
+//! [`InvalidToolSchema`].
 //!
 //! # What the transport does not do
 //!
@@ -112,5 +114,5 @@ pub use client::ClaudeCodeClient as Client;
 
 /// The rig ecosystem's conventional name for a provider's completion model.
 pub use model::ClaudeCodeModel as CompletionModel;
-pub use request::UnsupportedSetting;
+pub use request::{InvalidToolSchema, UnsupportedSetting};
 pub use response::{CliResponse, CliUsage, OutputTokenDetails};

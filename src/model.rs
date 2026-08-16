@@ -475,6 +475,10 @@ impl ClaudeCodeModel {
                 .arg(file.path().as_os_str());
             private_files.push(file);
         }
+        // Last on purpose. `--mcp-config` and `--allowedTools` take several
+        // values, so the CLI would read any positional argument after them
+        // as one more value. Nothing follows them here, and the prompt is on
+        // stdin.
         if let Some(file) = bridge_file {
             command
                 .arg("--mcp-config")

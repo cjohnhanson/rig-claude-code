@@ -1482,6 +1482,14 @@ async fn a_tool_call_from_the_cli_comes_back_as_a_rig_tool_call() {
         fake.value_after("--allowedTools").as_deref(),
         Some("mcp__rig")
     );
+    // `--allowedTools` takes several values, so anything after it would be
+    // read as another tool name. It must be the last flag.
+    let argv = fake.argv();
+    assert_eq!(
+        argv.last().map(String::as_str),
+        Some("mcp__rig"),
+        "{argv:?}"
+    );
 }
 
 #[tokio::test]

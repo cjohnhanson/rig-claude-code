@@ -283,7 +283,8 @@ The consequences for a caller:
 - A tool's `parameters` must fit the MCP tool shape: a JSON object with
   `"type": "object"` at the top level, a `properties` that is an object if
   present, and a `required` that is an array of strings if present. The turn
-  fails with a `RequestError` that names the tool otherwise. One tool outside
+  fails with a `RequestError` otherwise, and its cause is an
+  `InvalidToolSchema` that names the tool. One tool outside
   that shape, such as `{}`, a top-level `oneOf`, or `"required": "x"`, makes
   the CLI load none of the tools it was given, and it reports nothing the
   crate can see; the model then answers as if it had no tools. The check

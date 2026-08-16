@@ -142,6 +142,34 @@ impl std::fmt::Display for UnsupportedSetting {
 
 impl std::error::Error for UnsupportedSetting {}
 
+/// A tool definition whose `parameters` do not fit the MCP tool shape.
+///
+/// The cause behind the [`CompletionError::RequestError`] a turn returns when
+/// one of its tools would make the CLI load no tools at all. Downcast it from
+/// the error's source chain as with [`UnsupportedSetting`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct InvalidToolSchema {
+    /// The rig name of the tool.
+    pub tool: String,
+    /// What is wrong with its `parameters`, in the MCP tool shape's terms.
+    pub problem: &'static str,
+}
+
+impl std::fmt::Display for InvalidToolSchema {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the parameters of tool `{}` {}; the CLI would then load none of \
+             the tools it was given, without reporting it, and the model would \
+             answer as if it had no tools",
+            self.tool, self.problem
+        )
+    }
+}
+
+impl std::error::Error for InvalidToolSchema {}
+
 /// Build the invocation for `request`.
 ///
 /// `default_model` is used unless the request overrides it.
@@ -298,15 +326,10 @@ fn reject_unsupported(request: &CompletionRequest) -> Result<(), CompletionError
 fn check_tool_schema(tool: &rig_core::completion::ToolDefinition) -> Result<(), CompletionError> {
     match tool_schema_problem(&tool.parameters) {
         None => Ok(()),
-        Some(problem) => Err(CompletionError::RequestError(
-            format!(
-                "the parameters of tool `{}` {problem}; the CLI would then load \
-                 none of the tools it was given, without reporting it, and the \
-                 model would answer as if it had no tools",
-                tool.name
-            )
-            .into(),
-        )),
+        Some(problem) => Err(CompletionError::RequestError(Box::new(InvalidToolSchema {
+            tool: tool.name.clone(),
+            problem,
+        }))),
     }
 }
 
@@ -1351,6 +1374,13 @@ mod tests {
             let text = error.to_string();
             assert!(text.contains("`lookup`"), "{parameters}: {text}");
             assert!(text.contains("none of the tools"), "{parameters}: {text}");
+            let CompletionError::RequestError(source) = &error else {
+                unreachable!()
+            };
+            let cause = source
+                .downcast_ref::<InvalidToolSchema>()
+                .expect("the cause is an InvalidToolSchema");
+            assert_eq!(cause.tool, "lookup");
         }
     }
 

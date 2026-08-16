@@ -20,7 +20,7 @@ The public surface, in full:
   with rather than an API key. The client implements `ProviderClient`,
   `CompletionClient`, and `VerifyClient`. `ClaudeCodeClient::version` runs
   `claude --version`.
-- `ClientError`, `UnsupportedSetting`, `CliResponse`, `CliUsage`,
+- `ClientError`, `UnsupportedSetting`, `InvalidToolSchema`, `CliResponse`, `CliUsage`,
   `OutputTokenDetails`, the `models` module, `BINARY_ENV`, `DEFAULT_BINARY`.
 - Whole-answer completion through `prompt`, and streaming through
   `stream_prompt`. Streaming reads the CLI's newline-delimited JSON frames
@@ -41,8 +41,9 @@ The public surface, in full:
   per-tool rule missed it, so the model reported a missing permission. A
   tool whose `parameters` do not fit the MCP tool shape (`"type": "object"`
   at the top level; `properties` an object if present; `required` an array
-  of strings if present) is refused with a `RequestError` that names the
-  tool: one such tool makes the CLI load none of the tools it was given,
+  of strings if present) is refused with a `RequestError` whose cause is a
+  downcastable `InvalidToolSchema` naming the tool: one such tool makes the
+  CLI load none of the tools it was given,
   without reporting it, and the model answers as if it had no tools.
 - `UnsupportedSetting`: a public, downcastable cause for every request setting
   the transport cannot express: `temperature`, `max_tokens`,
