@@ -280,35 +280,63 @@ fn reject_unsupported(request: &CompletionRequest) -> Result<(), CompletionError
     Ok(())
 }
 
-/// Refuse a tool whose schema the CLI would drop without a word.
+/// Refuse a tool whose schema would make the CLI drop every tool.
 ///
-/// The CLI checks each MCP tool's input schema against what the API accepts
-/// and skips a tool that fails, logging where the crate cannot see. The
-/// model then never has the tool, and it answers as if the tool did not
-/// exist. Verified against 2.1.233 with `{}` and with a top-level `oneOf`.
-/// A native provider returns an API error for the same schema; this check
-/// gives the same loud failure before the turn spends any usage. The rule
-/// checked is the one the API states: the schema is an object with
-/// `"type": "object"` at the top level.
+/// The CLI parses each MCP server's tool list against the MCP tool shape:
+/// `type` is the literal `"object"`, `properties` if present is an object,
+/// `required` if present is an array of strings. One tool that fails makes
+/// the CLI load no tools at all from that server, and it reports nothing the
+/// crate can see. The model then answers as if it had no tools, and the turn
+/// ends with exit 0. Verified against 2.1.233 with `{}`, a top-level `oneOf`,
+/// `{"type": ["object", "null"]}`, a `$ref` root, `"properties": []`, and
+/// `"required": "x"`: each emptied the server's list, good tools included.
+/// This check gives a loud failure before the turn spends any usage.
+///
+/// What the API rejects beyond this shape (a property key with a space, a
+/// property type it does not know) the CLI loads and the API refuses with a
+/// 400, which arrives as a `ProviderResponse` error, so it needs no check.
 fn check_tool_schema(tool: &rig_core::completion::ToolDefinition) -> Result<(), CompletionError> {
-    let is_object_schema = tool
-        .parameters
-        .as_object()
-        .and_then(|schema| schema.get("type"))
-        .and_then(serde_json::Value::as_str)
-        == Some("object");
-    if is_object_schema {
-        return Ok(());
+    match tool_schema_problem(&tool.parameters) {
+        None => Ok(()),
+        Some(problem) => Err(CompletionError::RequestError(
+            format!(
+                "the parameters of tool `{}` {problem}; the CLI would then load \
+                 none of the tools it was given, without reporting it, and the \
+                 model would answer as if it had no tools",
+                tool.name
+            )
+            .into(),
+        )),
     }
-    Err(CompletionError::RequestError(
-        format!(
-            "the parameters of tool `{}` are not a JSON Schema object with \
-             `\"type\": \"object\"` at the top level; the CLI would drop the \
-             tool without reporting it, and the model would never see it",
-            tool.name
-        )
-        .into(),
-    ))
+}
+
+/// What is wrong with a tool schema, in the MCP tool shape's terms, if
+/// anything.
+fn tool_schema_problem(parameters: &serde_json::Value) -> Option<&'static str> {
+    let Some(schema) = parameters.as_object() else {
+        return Some("are not a JSON object");
+    };
+    if schema.get("type").and_then(serde_json::Value::as_str) != Some("object") {
+        return Some("do not have `\"type\": \"object\"` at the top level");
+    }
+    if schema
+        .get("properties")
+        .is_some_and(|value| !value.is_object())
+    {
+        return Some("have a `properties` that is not an object");
+    }
+    let is_string_array = |value: &serde_json::Value| {
+        value
+            .as_array()
+            .is_some_and(|items| items.iter().all(serde_json::Value::is_string))
+    };
+    if schema
+        .get("required")
+        .is_some_and(|value| !is_string_array(value))
+    {
+        return Some("have a `required` that is not an array of strings");
+    }
+    None
 }
 
 /// Build the rejection for one unsupported setting.
@@ -1261,13 +1289,53 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_schema_without_a_top_level_object_type_is_refused_by_name() {
-        // `{}` and a top-level `oneOf` are both dropped by the CLI silently.
+    fn a_tool_schema_in_the_mcp_shape_passes() {
+        for parameters in [
+            serde_json::json!({ "type": "object" }),
+            serde_json::json!({ "type": "object", "properties": {} }),
+            serde_json::json!({
+                "type": "object",
+                "properties": { "x": { "type": "string" } },
+                "required": ["x"]
+            }),
+            serde_json::json!({ "type": "object", "required": [] }),
+            // Extra keywords beside the shape are the CLI's business.
+            serde_json::json!({
+                "type": "object",
+                "anyOf": [{ "required": ["x"] }],
+                "$schema": "x"
+            }),
+        ] {
+            let mut req = request("hi");
+            req.tools = vec![rig_core::completion::ToolDefinition {
+                name: "lookup".to_owned(),
+                description: String::new(),
+                parameters: parameters.clone(),
+            }];
+            assert!(
+                build("haiku", &req, Mode::Blocking).is_ok(),
+                "{parameters} must pass"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tool_schema_outside_the_mcp_shape_is_refused_by_name() {
+        // Each of these made the CLI load zero tools from the server.
         for parameters in [
             serde_json::json!({}),
             serde_json::json!({ "oneOf": [{ "type": "object" }] }),
             serde_json::json!("not an object"),
             serde_json::json!({ "type": "string" }),
+            serde_json::json!({ "type": ["object", "null"] }),
+            serde_json::json!({ "$ref": "#/$defs/Args" }),
+            serde_json::json!({ "type": "object", "properties": [] }),
+            serde_json::json!({
+                "type": "object",
+                "properties": { "x": {} },
+                "required": "x"
+            }),
+            serde_json::json!({ "type": "object", "required": [1] }),
         ] {
             let mut req = request("hi");
             req.tools = vec![rig_core::completion::ToolDefinition {
@@ -1282,10 +1350,7 @@ mod tests {
             );
             let text = error.to_string();
             assert!(text.contains("`lookup`"), "{parameters}: {text}");
-            assert!(
-                text.contains("\"type\": \"object\""),
-                "{parameters}: {text}"
-            );
+            assert!(text.contains("none of the tools"), "{parameters}: {text}");
         }
     }
 

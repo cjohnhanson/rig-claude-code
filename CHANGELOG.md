@@ -39,10 +39,11 @@ The public surface, in full:
   rather than one rule per tool: the CLI rewrites a tool name such as
   `lookup.price` to `lookup_price` in its own name for the tool, and a
   per-tool rule missed it, so the model reported a missing permission. A
-  tool whose `parameters` are not an object schema with `"type": "object"`
-  is refused with a `RequestError` that names the tool: the CLI drops such a
-  tool without reporting it, and the model answers as if the tool did not
-  exist.
+  tool whose `parameters` do not fit the MCP tool shape (`"type": "object"`
+  at the top level; `properties` an object if present; `required` an array
+  of strings if present) is refused with a `RequestError` that names the
+  tool: one such tool makes the CLI load none of the tools it was given,
+  without reporting it, and the model answers as if it had no tools.
 - `UnsupportedSetting`: a public, downcastable cause for every request setting
   the transport cannot express: `temperature`, `max_tokens`,
   `additional_params`, a `tool_choice` of `Required` or `Specific`, a last

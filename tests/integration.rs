@@ -1523,6 +1523,40 @@ async fn a_callers_mcp_config_and_the_bridge_both_reach_the_cli_with_the_bridge_
 }
 
 #[tokio::test]
+async fn a_tool_outside_the_mcp_shape_is_refused_before_anything_runs() {
+    // Through both entry points, and before a child or a bridge exists: the
+    // fake must not be invoked and no usage may be spent.
+    let fake = FakeClaude::printing(&envelope("never"));
+    let model = ClaudeCodeModel::new("haiku").with_binary(fake.path());
+    let bad_tool = || rig_core::completion::ToolDefinition {
+        name: "lookup".to_owned(),
+        description: String::new(),
+        parameters: serde_json::json!({ "type": "object", "required": "x" }),
+    };
+
+    let mut req = request("hi");
+    req.tools = vec![bad_tool()];
+    let error = model.completion(req).await.unwrap_err();
+    assert!(
+        matches!(error, CompletionError::RequestError(_)),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("`lookup`"), "{error}");
+
+    let mut req = request("hi");
+    req.tools = vec![bad_tool()];
+    let Err(error) = model.stream(req).await else {
+        panic!("the stream must be refused too");
+    };
+    assert!(
+        matches!(error, CompletionError::RequestError(_)),
+        "{error:?}"
+    );
+
+    assert_eq!(fake.spawn_count(), 0, "no child ran");
+}
+
+#[tokio::test]
 async fn the_bridge_token_travels_in_a_private_file_not_in_argv() {
     // The token keeps other local processes off the bridge. In argv it would
     // be readable through `ps` by exactly those processes.
