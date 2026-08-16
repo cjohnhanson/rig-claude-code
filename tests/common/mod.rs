@@ -485,14 +485,6 @@ if [ -n "${{CLAUDECODE+set}}" ]; then echo present > "$here/nested"; else echo a
     }
 }
 
-/// The shell that makes the fake call tools on the bridge over MCP.
-///
-/// Streamable HTTP MCP needs an `initialize` round trip before a
-/// `tools/call`; the session id comes back in a header and must be echoed.
-/// The `Authorization` header from the config goes on every request, as the
-/// real CLI forwards `headers` from an http server entry.
-/// Everything here is POST-and-parse with curl and sed, so the fake stays a
-/// plain shell script. Empty when there is nothing to call.
 /// The part of the fake's argv loop that captures `--mcp-config`.
 ///
 /// The crate passes its bridge configuration as a file path; a caller's own
@@ -514,6 +506,14 @@ const MCP_CONFIG_SCAN: &str = r#"  if [ -n "$next_is_mcp" ]; then
   if [ "$a" = "--mcp-config" ]; then next_is_mcp=1; fi
 "#;
 
+/// The shell that makes the fake call tools on the bridge over MCP.
+///
+/// Streamable HTTP MCP needs an `initialize` round trip before a
+/// `tools/call`; the session id comes back in a header and must be echoed.
+/// The `Authorization` header from the config goes on every request, as the
+/// real CLI forwards `headers` from an http server entry.
+/// Everything here is POST-and-parse with curl and sed, so the fake stays a
+/// plain shell script. Empty when there is nothing to call.
 fn mcp_script(calls: &[(String, String)]) -> String {
     use std::fmt::Write as _;
 

@@ -119,7 +119,8 @@ impl ServerHandler for Handler {
 /// is available through [`Bridge::take_calls`].
 ///
 /// The listener binds loopback only, but loopback is shared with every
-/// process on the machine, and the port is visible in the CLI's argv. A
+/// process on the machine, and a listening port is discoverable by any of
+/// them (`lsof -i`, `netstat`). A
 /// stranger who found it could POST a `tools/call`, the turn would return it
 /// as a `ToolCall`, and rig would *execute that tool with the stranger's
 /// arguments*. So each bridge mints a random bearer token, hands it to the
@@ -425,8 +426,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_request_without_the_token_is_refused_before_it_reaches_mcp() {
-        // Loopback is shared with every local process, and the port is in the
-        // CLI's argv. A stranger's `tools/call` would otherwise be recorded,
+        // Loopback is shared with every local process, and a listening port
+        // is discoverable by any of them. A stranger's `tools/call` would
+        // otherwise be recorded,
         // returned as a ToolCall, and executed by rig with the stranger's
         // arguments.
         let bridge = Bridge::start(&[add_tool()]).await.unwrap();

@@ -308,21 +308,30 @@ fn reject_unsupported(request: &CompletionRequest) -> Result<(), CompletionError
     Ok(())
 }
 
-/// Refuse a tool whose schema would make the CLI drop every tool.
+/// Refuse a tool whose schema the CLI would drop or rewrite in silence.
 ///
-/// The CLI parses each MCP server's tool list against the MCP tool shape:
-/// `type` is the literal `"object"`, `properties` if present is an object,
-/// `required` if present is an array of strings. One tool that fails makes
-/// the CLI load no tools at all from that server, and it reports nothing the
-/// crate can see. The model then answers as if it had no tools, and the turn
-/// ends with exit 0. Verified against 2.1.233 with `{}`, a top-level `oneOf`,
-/// `{"type": ["object", "null"]}`, a `$ref` root, `"properties": []`, and
-/// `"required": "x"`: each emptied the server's list, good tools included.
-/// This check gives a loud failure before the turn spends any usage.
+/// Two gates in the CLI, both silent to the crate. First, it parses each MCP
+/// server's tool list against the MCP tool shape: `type` is the literal
+/// `"object"`, `properties` if present is an object, `required` if present
+/// is an array of strings. One tool that fails makes the CLI load no tools at
+/// all from that server. The model then answers as if it had no tools, and
+/// the turn ends with exit 0. Verified against 2.1.233 with `{}`, a top-level
+/// `oneOf` in place of `type`, `{"type": ["object", "null"]}`, a `$ref` root,
+/// `"properties": []`, and `"required": "x"`: each emptied the server's
+/// list, good tools included.
 ///
-/// What the API rejects beyond this shape (a property key with a space, a
-/// property type it does not know) the CLI loads and the API refuses with a
-/// 400, which arrives as a `ProviderResponse` error, so it needs no check.
+/// Second, per tool: a top-level `anyOf`, `oneOf`, or `allOf` beside
+/// `"type": "object"` is either flattened into the schema with a note added
+/// to the description, or the tool is skipped, according to a flag the CLI
+/// fetches remotely. A property key outside `[A-Za-z0-9_.-]{1,64}` is
+/// either kept for the API to refuse with a 400, or skipped, again by remote
+/// flag. Neither outcome is one the crate can see or promise, so both are
+/// refused here. This check gives a loud failure before the turn spends any
+/// usage.
+///
+/// What the API rejects beyond these (a property type it does not know) the
+/// CLI loads and the API refuses with a 400, which arrives as a
+/// `ProviderResponse` error, so it needs no check.
 fn check_tool_schema(tool: &rig_core::completion::ToolDefinition) -> Result<(), CompletionError> {
     match tool_schema_problem(&tool.parameters) {
         None => Ok(()),
@@ -358,6 +367,27 @@ fn tool_schema_problem(parameters: &serde_json::Value) -> Option<&'static str> {
         .is_some_and(|value| !is_string_array(value))
     {
         return Some("have a `required` that is not an array of strings");
+    }
+    if ["anyOf", "oneOf", "allOf"]
+        .iter()
+        .any(|keyword| schema.contains_key(*keyword))
+    {
+        return Some("have a top-level `anyOf`, `oneOf`, or `allOf`");
+    }
+    let key_is_valid = |key: &str| {
+        (1..=64).contains(&key.len())
+            && key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    };
+    if schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|properties| !properties.keys().all(|key| key_is_valid(key)))
+    {
+        return Some(
+            "have a property key outside `[A-Za-z0-9_.-]{1,64}`, which the API does not accept",
+        );
     }
     None
 }
@@ -1322,11 +1352,17 @@ mod tests {
                 "required": ["x"]
             }),
             serde_json::json!({ "type": "object", "required": [] }),
-            // Extra keywords beside the shape are the CLI's business.
+            // Other keywords beside the shape are the CLI's business, and
+            // property keys may use the whole permitted alphabet.
             serde_json::json!({
                 "type": "object",
-                "anyOf": [{ "required": ["x"] }],
-                "$schema": "x"
+                "$schema": "x",
+                "title": "Args",
+                "additionalProperties": false,
+                "properties": {
+                    "a-b.c_D9": { "oneOf": [{ "type": "string" }, { "type": "null" }] },
+                    "x": true
+                }
             }),
         ] {
             let mut req = request("hi");
@@ -1359,6 +1395,13 @@ mod tests {
                 "required": "x"
             }),
             serde_json::json!({ "type": "object", "required": [1] }),
+            // Per-tool gates behind remote flags: flattened or skipped.
+            serde_json::json!({ "type": "object", "anyOf": [{ "required": ["x"] }] }),
+            serde_json::json!({ "type": "object", "oneOf": [{ "required": ["x"] }] }),
+            serde_json::json!({ "type": "object", "allOf": [{ "required": ["x"] }] }),
+            serde_json::json!({ "type": "object", "properties": { "bad key": {} } }),
+            serde_json::json!({ "type": "object", "properties": { "": {} } }),
+            serde_json::json!({ "type": "object", "properties": { "x".repeat(65): {} } }),
         ] {
             let mut req = request("hi");
             req.tools = vec![rig_core::completion::ToolDefinition {

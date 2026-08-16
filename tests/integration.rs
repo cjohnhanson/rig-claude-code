@@ -1595,6 +1595,15 @@ async fn the_bridge_token_travels_in_a_private_file_not_in_argv() {
     );
     // And the fake reached the bridge with the token from the file.
     assert!(fake.mcp_reply(0).is_some(), "the call was recorded");
+    // The file lives exactly as long as the turn: it is gone once the turn
+    // has returned, so a token cannot be read from a leftover file.
+    let path = fake
+        .value_after("--mcp-config")
+        .expect("the bridge configuration path was passed");
+    assert!(
+        !std::path::Path::new(&path).exists(),
+        "the configuration file must be deleted after the turn: {path}"
+    );
 }
 
 #[tokio::test]

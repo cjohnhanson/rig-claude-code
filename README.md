@@ -252,16 +252,16 @@ a tool call needs one turn to ask and one to answer with the result in hand.
 ### How the loop works
 
 The CLI is an agent harness of its own. When its model emits a tool call, the
-harness looks the tool up, and if it finds none it tells the model the tool
-does not exist. So the crate cannot describe tools in the prompt and read the
-calls back from the text: the model reaches for a real tool call, the harness
+harness looks the tool up. If it finds none, it tells the model the tool does
+not exist. So the crate cannot describe tools in the prompt and read the calls
+back from the text. The model reaches for a real tool call, the harness
 rejects it, and the model reports the tool as broken.
 
 Instead, for each turn that carries rig tools, the crate binds a loopback
-HTTP listener, serves MCP on it with rig's tool definitions, and points the
-CLI at it. The server executes nothing. It records each call the CLI makes
-and answers with an acknowledgement. The turn's response then carries the
-recorded calls, and rig runs its own tool implementations, appends the
+HTTP listener and serves MCP on it with rig's tool definitions. It points the
+CLI at that server. The server executes nothing. It records each call the CLI
+makes and answers with an acknowledgement. The turn's response then carries
+the recorded calls. rig runs its own tool implementations, appends the
 results, and asks again. Tool calls and results appear in the next turn's
 prompt in full, so the model sees what it asked and what came back.
 
@@ -270,30 +270,34 @@ The consequences for a caller:
 - Tools run in your process, with rig's hooks and permissions, exactly as with
   any other provider.
 - Each turn that carries tools opens a loopback port for its duration. Every
-  local process can reach that port, so the crate mints a random bearer token
-  per turn, hands it to the CLI in a 0600 file it reads as its MCP
-  configuration, and answers `401` to any request without it. The token is
-  not in the child's argument vector, so `ps` does not show it. A recorded
-  call therefore came from a process that could read this user's files, in
+  local process can reach that port. So the crate mints a random bearer token
+  per turn and answers `401` to any request without it. The CLI reads the
+  token from a 0600 file that holds its MCP configuration. The token is not in
+  the child's argument vector, so `ps` does not show it. A recorded call
+  therefore came from a process that could read this user's files, in
   practice this turn's CLI.
-- The model's text on a turn that made calls is discarded, since it was
-  written before any result existed. rig's runner asks again.
-- `tool_choice` `Auto` and `None` are honored. `Required` and `Specific` are
-  refused: the CLI's harness decides whether the model calls a tool.
+- The crate discards the model's text on a turn that made calls, since the
+  model wrote it before any result existed. rig's runner asks again.
+- The crate honors a `tool_choice` of `Auto` or `None`. It refuses `Required`
+  and `Specific`: the CLI's harness decides whether the model calls a tool.
 - A tool's `parameters` must fit the MCP tool shape: a JSON object with
   `"type": "object"` at the top level, a `properties` that is an object if
-  present, and a `required` that is an array of strings if present. The turn
-  fails with a `RequestError` otherwise, and its cause is an
-  `InvalidToolSchema` that names the tool. One tool outside
-  that shape, such as `{}`, a top-level `oneOf`, or `"required": "x"`, makes
-  the CLI load none of the tools it was given, and it reports nothing the
-  crate can see; the model then answers as if it had no tools. The check
-  turns that silent failure into a loud one before any usage is spent.
+  present, and a `required` that is an array of strings if present. The
+  schema must also have no top-level `anyOf`, `oneOf`, or `allOf`, and each
+  property key must match `[A-Za-z0-9_.-]{1,64}`. Otherwise the turn fails
+  with a `RequestError` whose cause is an `InvalidToolSchema` that names the
+  tool. The reason is that the CLI handles each of these cases in silence.
+  One tool outside the shape, such as `{}` or `"required": "x"`, makes the
+  CLI load none of the tools it was given. A top-level combinator or a bad
+  property key makes the CLI rewrite or skip that tool, according to a flag
+  it fetches remotely. In each case the crate sees nothing, and the model
+  answers as if the tool did not exist. The check turns that silent failure
+  into a loud one before any usage is spent.
 
 `with_mcp_config` still passes an MCP server of your own to the CLI, and its
 tools run inside the CLI as before. The two mechanisms coexist. The crate's
-own server is named `rig`; a server of that name in your configuration is
-shadowed on any turn that carries rig tools.
+own server is named `rig`. The crate's server shadows a server of that name
+in your configuration on any turn that carries rig tools.
 
 ## Handle a failed turn
 

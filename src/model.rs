@@ -113,7 +113,10 @@ fn require_pipe<T>(pipe: Option<T>, name: &str) -> Result<T, CompletionError> {
 ///
 /// `NamedTempFile` creates the file 0600, which matters because the system
 /// prompt holds whatever the caller put in a preamble.
-fn write_private_file(text: &str) -> Result<tempfile::NamedTempFile, CompletionError> {
+fn write_private_file(
+    text: &str,
+    purpose: &str,
+) -> Result<tempfile::NamedTempFile, CompletionError> {
     let write = || -> std::io::Result<tempfile::NamedTempFile> {
         let mut file = tempfile::NamedTempFile::new()?;
         file.write_all(text.as_bytes())?;
@@ -121,9 +124,7 @@ fn write_private_file(text: &str) -> Result<tempfile::NamedTempFile, CompletionE
         Ok(file)
     };
     write().map_err(|error| {
-        CompletionError::ProviderError(format!(
-            "cannot create a file for the system prompt: {error}"
-        ))
+        CompletionError::ProviderError(format!("cannot create a file for {purpose}: {error}"))
     })
 }
 
@@ -448,7 +449,7 @@ impl ClaudeCodeModel {
         let system_file = spec
             .system_prompt
             .as_deref()
-            .map(write_private_file)
+            .map(|text| write_private_file(text, "the system prompt"))
             .transpose()?;
 
         // The bridge's configuration carries the turn's bearer token. In argv
@@ -457,7 +458,9 @@ impl ClaudeCodeModel {
         // `--mcp-config` from a file path as well as inline JSON, and
         // forwards `headers` from either (verified against 2.1.233).
         let bridge_file = bridge
-            .map(|bridge| write_private_file(&bridge.mcp_config()))
+            .map(|bridge| {
+                write_private_file(&bridge.mcp_config(), "the tool bridge's configuration")
+            })
             .transpose()?;
 
         let mut command = Command::new(&self.binary);

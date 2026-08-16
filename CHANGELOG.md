@@ -32,19 +32,21 @@ The public surface, in full:
   failed. A streamed turn yields the model's pre-enforcement prose; the
   enforced JSON is in the terminal frame.
 - rig tools, executed by rig. For each turn that carries tools the crate
-  serves them to the CLI over a per-turn loopback MCP server, records the
-  calls the CLI makes, and returns them as `AssistantContent::ToolCall` for
+  serves them to the CLI over a per-turn loopback MCP server. It records the
+  calls the CLI makes and returns them as `AssistantContent::ToolCall` for
   rig's runner to execute. Tool calls and results render in full into the
-  next turn's prompt. The CLI is allowed the whole server with one rule
-  rather than one rule per tool: the CLI rewrites a tool name such as
-  `lookup.price` to `lookup_price` in its own name for the tool, and a
-  per-tool rule missed it, so the model reported a missing permission. A
-  tool whose `parameters` do not fit the MCP tool shape (`"type": "object"`
-  at the top level; `properties` an object if present; `required` an array
-  of strings if present) is refused with a `RequestError` whose cause is a
-  downcastable `InvalidToolSchema` naming the tool: one such tool makes the
-  CLI load none of the tools it was given,
-  without reporting it, and the model answers as if it had no tools.
+  next turn's prompt. The crate allows the CLI the whole server with one
+  rule, not one rule per tool. The CLI rewrites a tool name such as
+  `lookup.price` to `lookup_price` in its own name for the tool, so a
+  per-tool rule missed it and the model reported a missing permission. A
+  tool whose `parameters` do not fit the MCP tool shape is refused with a
+  `RequestError` whose cause is a downcastable `InvalidToolSchema` that
+  names the tool. The shape is `"type": "object"` at the top level,
+  `properties` an object if present, `required` an array of strings if
+  present, no top-level `anyOf`, `oneOf`, or `allOf`, and property keys in
+  `[A-Za-z0-9_.-]{1,64}`. The CLI handles each of these in silence: one tool
+  outside the shape makes it load none of the tools it was given, and a
+  combinator or a bad key makes it rewrite or skip the tool by remote flag.
 - `UnsupportedSetting`: a public, downcastable cause for every request setting
   the transport cannot express: `temperature`, `max_tokens`,
   `additional_params`, a `tool_choice` of `Required` or `Specific`, a last
@@ -94,14 +96,14 @@ The public surface, in full:
   and cost of every turn. Variables that select the credential, such as
   `CLAUDE_CONFIG_DIR` and `ANTHROPIC_API_KEY`, are left alone on purpose.
 - The per-turn tool bridge requires a bearer token. The bridge listens on
-  loopback, which every local process can reach, and its port is visible in
-  the CLI's argument vector. Without a token any local process could post a
-  `tools/call` that the crate would record, return as a `ToolCall`, and let
-  rig execute with the stranger's arguments. Each turn mints 256 random bits
-  from the OS, writes them as an `Authorization` header into a 0600 file the
-  CLI reads as its MCP configuration, and answers `401` to any request that
-  does not present them. The configuration goes through a file and not
-  inline in `--mcp-config` because argv is readable through `ps` by the same
+  loopback, which every local process can reach, and any of them can
+  discover a listening port. Without a token any local process could post a
+  `tools/call`. The crate would record it, return it as a `ToolCall`, and
+  let rig execute it with the stranger's arguments. So each turn mints 256
+  random bits from the OS and answers `401` to any request that does not
+  present them. The CLI reads them as an `Authorization` header from a 0600
+  file that holds its MCP configuration. The configuration goes through a
+  file and not inline in `--mcp-config` because `ps` shows argv to the same
   local processes the token keeps out.
 
 [Unreleased]: https://github.com/cjohnhanson/rig-claude-code
