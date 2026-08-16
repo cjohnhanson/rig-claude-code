@@ -321,6 +321,11 @@ impl Bridge {
 }
 
 /// Convert a rig tool definition into an MCP tool.
+///
+/// The request path has already refused any definition whose parameters are
+/// not an object schema (`request::check_tool_schema`), so the fallback here
+/// is never reached from a real turn. It stays because `Tool::new` needs a
+/// map and this function is not the place to fail.
 fn to_mcp_tool(definition: &ToolDefinition) -> Tool {
     let schema = match &definition.parameters {
         serde_json::Value::Object(map) => map.clone(),

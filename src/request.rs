@@ -272,7 +272,43 @@ fn reject_unsupported(request: &CompletionRequest) -> Result<(), CompletionError
             );
         }
     }
+    if advertises_tools(request) {
+        for tool in &request.tools {
+            check_tool_schema(tool)?;
+        }
+    }
     Ok(())
+}
+
+/// Refuse a tool whose schema the CLI would drop without a word.
+///
+/// The CLI checks each MCP tool's input schema against what the API accepts
+/// and skips a tool that fails, logging where the crate cannot see. The
+/// model then never has the tool, and it answers as if the tool did not
+/// exist. Verified against 2.1.233 with `{}` and with a top-level `oneOf`.
+/// A native provider returns an API error for the same schema; this check
+/// gives the same loud failure before the turn spends any usage. The rule
+/// checked is the one the API states: the schema is an object with
+/// `"type": "object"` at the top level.
+fn check_tool_schema(tool: &rig_core::completion::ToolDefinition) -> Result<(), CompletionError> {
+    let is_object_schema = tool
+        .parameters
+        .as_object()
+        .and_then(|schema| schema.get("type"))
+        .and_then(serde_json::Value::as_str)
+        == Some("object");
+    if is_object_schema {
+        return Ok(());
+    }
+    Err(CompletionError::RequestError(
+        format!(
+            "the parameters of tool `{}` are not a JSON Schema object with \
+             `\"type\": \"object\"` at the top level; the CLI would drop the \
+             tool without reporting it, and the model would never see it",
+            tool.name
+        )
+        .into(),
+    ))
 }
 
 /// Build the rejection for one unsupported setting.
@@ -1135,7 +1171,7 @@ mod tests {
         req.tools = vec![rig_core::completion::ToolDefinition {
             name: "add".to_owned(),
             description: "adds".to_owned(),
-            parameters: serde_json::json!({}),
+            parameters: serde_json::json!({ "type": "object" }),
         }];
         assert!(advertises_tools(&req));
         let spec = spec_for(&req);
@@ -1222,6 +1258,48 @@ mod tests {
                 "{choice:?} would ask the crate to force a call the CLI decides"
             );
         }
+    }
+
+    #[test]
+    fn a_tool_schema_without_a_top_level_object_type_is_refused_by_name() {
+        // `{}` and a top-level `oneOf` are both dropped by the CLI silently.
+        for parameters in [
+            serde_json::json!({}),
+            serde_json::json!({ "oneOf": [{ "type": "object" }] }),
+            serde_json::json!("not an object"),
+            serde_json::json!({ "type": "string" }),
+        ] {
+            let mut req = request("hi");
+            req.tools = vec![rig_core::completion::ToolDefinition {
+                name: "lookup".to_owned(),
+                description: String::new(),
+                parameters: parameters.clone(),
+            }];
+            let error = error_for(&req);
+            assert!(
+                matches!(&error, CompletionError::RequestError(_)),
+                "{parameters}: {error:?}"
+            );
+            let text = error.to_string();
+            assert!(text.contains("`lookup`"), "{parameters}: {text}");
+            assert!(
+                text.contains("\"type\": \"object\""),
+                "{parameters}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tool_schema_is_not_checked_when_the_tools_are_withheld() {
+        // ToolChoice::None never advertises, so a bad schema costs nothing.
+        let mut req = request("hi");
+        req.tool_choice = Some(ToolChoice::None);
+        req.tools = vec![rig_core::completion::ToolDefinition {
+            name: "lookup".to_owned(),
+            description: String::new(),
+            parameters: serde_json::json!({}),
+        }];
+        assert!(build("haiku", &req, Mode::Blocking).is_ok());
     }
 
     #[test]

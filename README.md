@@ -278,6 +278,12 @@ The consequences for a caller:
   written before any result existed. rig's runner asks again.
 - `tool_choice` `Auto` and `None` are honored. `Required` and `Specific` are
   refused: the CLI's harness decides whether the model calls a tool.
+- A tool's `parameters` must be a JSON Schema object with `"type": "object"`
+  at the top level. The turn fails with a `RequestError` that names the tool
+  otherwise. The CLI drops a tool whose schema it expects the API to reject,
+  such as `{}` or one with a top-level `oneOf`, and reports nothing the crate
+  can see; the model then answers as if the tool did not exist. The check
+  turns that silent failure into a loud one before any usage is spent.
 
 `with_mcp_config` still passes an MCP server of your own to the CLI, and its
 tools run inside the CLI as before. The two mechanisms coexist.

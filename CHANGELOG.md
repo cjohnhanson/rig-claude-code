@@ -38,7 +38,11 @@ The public surface, in full:
   next turn's prompt. The CLI is allowed the whole server with one rule
   rather than one rule per tool: the CLI rewrites a tool name such as
   `lookup.price` to `lookup_price` in its own name for the tool, and a
-  per-tool rule missed it, so the model reported a missing permission.
+  per-tool rule missed it, so the model reported a missing permission. A
+  tool whose `parameters` are not an object schema with `"type": "object"`
+  is refused with a `RequestError` that names the tool: the CLI drops such a
+  tool without reporting it, and the model answers as if the tool did not
+  exist.
 - `UnsupportedSetting`: a public, downcastable cause for every request setting
   the transport cannot express: `temperature`, `max_tokens`,
   `additional_params`, a `tool_choice` of `Required` or `Specific`, a last
