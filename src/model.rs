@@ -857,6 +857,11 @@ async fn await_exit(
 /// nothing else: text the model wrote on that turn is dropped, as the
 /// blocking path drops it, because it was written against the placeholder.
 /// Otherwise the held text, in order. The final response last either way.
+///
+/// Draining the calls at the terminal frame is not a race. The bridge records
+/// a call before it replies, the CLI waits for the reply before it asks the
+/// model again, and the terminal frame follows the model's last message. So
+/// every call of the turn is recorded before the terminal frame is written.
 fn finish_items(
     bridge: Option<&Bridge>,
     held: Vec<RawStreamingChoice<CliResponse>>,

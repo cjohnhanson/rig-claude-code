@@ -52,7 +52,8 @@ const PLACEHOLDER: &str = "The harness has recorded this call and will run it. C
 pub(crate) struct RecordedCall {
     /// A fresh id for the call, minted here.
     pub(crate) id: String,
-    /// The tool's rig name, with the MCP prefix removed.
+    /// The tool's rig name. The `mcp__rig__` prefix exists only inside the
+    /// CLI; over MCP the CLI sends the bare name.
     pub(crate) name: String,
     /// The arguments as the model supplied them.
     pub(crate) arguments: serde_json::Value,
@@ -240,12 +241,18 @@ impl Bridge {
         });
 
         let serve = tokio::spawn(async move {
+            // Connections live in a JoinSet owned by this task. Aborting the
+            // task drops the set, and dropping the set aborts every
+            // connection, so a dropped bridge leaves no server behind.
+            let mut connections = tokio::task::JoinSet::new();
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     break;
                 };
+                // Reap finished connections so the set does not grow.
+                while connections.try_join_next().is_some() {}
                 let service = service.clone();
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     let io = hyper_util::rt::TokioIo::new(stream);
                     let _ = hyper_util::server::conn::auto::Builder::new(
                         hyper_util::rt::TokioExecutor::new(),
@@ -446,6 +453,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_bridge_ends_a_live_connection() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        // A keep-alive connection that already served one request. Without
+        // the JoinSet, aborting the accept loop would leave this connection
+        // served until the peer closed it.
+        let bridge = Bridge::start(&[add_tool()]).await.unwrap();
+        let addr = bridge
+            .url()
+            .trim_start_matches("http://")
+            .trim_end_matches("/mcp")
+            .to_owned();
+        let mut socket = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        socket
+            .write_all(b"POST /mcp HTTP/1.1\r\nHost: x\r\nAccept: application/json\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buffer = [0u8; 4096];
+        let read = socket.read(&mut buffer).await.unwrap();
+        assert!(String::from_utf8_lossy(&buffer[..read]).starts_with("HTTP/1.1 401"));
+
+        drop(bridge);
+
+        // Aborting the connection task drops its socket; the peer sees EOF
+        // or a reset, never a hang.
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut sink = Vec::new();
+            socket.read_to_end(&mut sink).await
+        })
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "the connection stayed open after the bridge dropped"
+        );
     }
 
     #[tokio::test]
