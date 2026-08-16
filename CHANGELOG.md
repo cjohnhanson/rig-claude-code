@@ -35,7 +35,10 @@ The public surface, in full:
   serves them to the CLI over a per-turn loopback MCP server, records the
   calls the CLI makes, and returns them as `AssistantContent::ToolCall` for
   rig's runner to execute. Tool calls and results render in full into the
-  next turn's prompt.
+  next turn's prompt. The CLI is allowed the whole server with one rule
+  rather than one rule per tool: the CLI rewrites a tool name such as
+  `lookup.price` to `lookup_price` in its own name for the tool, and a
+  per-tool rule missed it, so the model reported a missing permission.
 - `UnsupportedSetting`: a public, downcastable cause for every request setting
   the transport cannot express: `temperature`, `max_tokens`,
   `additional_params`, a `tool_choice` of `Required` or `Specific`, a last

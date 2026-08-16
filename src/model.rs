@@ -433,7 +433,6 @@ impl ClaudeCodeModel {
         &self,
         spec: &CommandSpec,
         bridge: Option<&Bridge>,
-        tools: &[rig_core::completion::ToolDefinition],
     ) -> Result<(Child, AbortOnDrop, Option<tempfile::NamedTempFile>), CompletionError> {
         self.check_extra_args()?;
 
@@ -465,7 +464,7 @@ impl ClaudeCodeModel {
                 .arg("--mcp-config")
                 .arg(bridge.mcp_config())
                 .arg("--allowedTools")
-                .arg(Bridge::allowed_tools(tools));
+                .arg(Bridge::allowed_tools());
         }
         if let Some(dir) = &self.current_dir {
             command.current_dir(dir);
@@ -505,8 +504,7 @@ impl CompletionModel for ClaudeCodeModel {
     ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
         let spec = request::build(&self.model, &request, request::Mode::Blocking)?;
         let bridge = self.start_bridge(&request).await?;
-        let (mut child, feed, _system_file) =
-            self.spawn_child(&spec, bridge.as_ref(), &request.tools)?;
+        let (mut child, feed, _system_file) = self.spawn_child(&spec, bridge.as_ref())?;
 
         let stdout = require_pipe(child.stdout.take(), "stdout")?;
         let stderr = require_pipe(child.stderr.take(), "stderr")?;
@@ -590,8 +588,7 @@ impl CompletionModel for ClaudeCodeModel {
     ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
         let spec = request::build(&self.model, &request, request::Mode::Streaming)?;
         let bridge = self.start_bridge(&request).await?;
-        let (mut child, feed, system_file) =
-            self.spawn_child(&spec, bridge.as_ref(), &request.tools)?;
+        let (mut child, feed, system_file) = self.spawn_child(&spec, bridge.as_ref())?;
 
         let stdout = require_pipe(child.stdout.take(), "stdout")?;
         let stderr = require_pipe(child.stderr.take(), "stderr")?;

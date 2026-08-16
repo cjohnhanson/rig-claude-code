@@ -298,12 +298,17 @@ impl Bridge {
     }
 
     /// The `--allowedTools` value that lets the CLI call every tool served.
-    pub(crate) fn allowed_tools(tools: &[ToolDefinition]) -> String {
-        tools
-            .iter()
-            .map(|tool| format!("mcp__{SERVER_NAME}__{}", tool.name))
-            .collect::<Vec<_>>()
-            .join(",")
+    ///
+    /// One rule for the whole server, not one per tool. The CLI rewrites each
+    /// tool name to `mcp__rig__<name>` with every character outside
+    /// `[A-Za-z0-9_-]` replaced by `_`, and a per-tool rule has to match that
+    /// rewritten name exactly. A rig tool named `lookup.price` was advertised
+    /// as `mcp__rig__lookup_price` and allowed as `mcp__rig__lookup.price`, so
+    /// the CLI refused it and the model reported a missing permission.
+    /// Verified against 2.1.233. The server rule matches whatever the CLI
+    /// calls the tool, and this server serves nothing but rig's tools.
+    pub(crate) fn allowed_tools() -> String {
+        format!("mcp__{SERVER_NAME}")
     }
 
     /// Every call the CLI made, in order, and clear the record.
@@ -351,19 +356,10 @@ mod tests {
     }
 
     #[test]
-    fn allowed_tools_carries_the_mcp_prefix_for_every_tool() {
-        let tools = vec![
-            add_tool(),
-            ToolDefinition {
-                name: "lookup".to_owned(),
-                description: String::new(),
-                parameters: serde_json::json!({}),
-            },
-        ];
-        assert_eq!(
-            Bridge::allowed_tools(&tools),
-            "mcp__rig__add,mcp__rig__lookup"
-        );
+    fn allowed_tools_is_one_rule_for_the_whole_server() {
+        // Not per tool: the CLI rewrites `lookup.price` to `lookup_price`
+        // in its own name for the tool, and a per-tool rule would miss it.
+        assert_eq!(Bridge::allowed_tools(), "mcp__rig");
     }
 
     #[test]

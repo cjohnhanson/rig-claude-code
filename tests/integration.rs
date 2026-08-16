@@ -1476,9 +1476,11 @@ async fn a_tool_call_from_the_cli_comes_back_as_a_rig_tool_call() {
         fake.value_after("--mcp-config").is_some(),
         "the bridge was passed to the CLI"
     );
+    // One rule for the whole server: a per-tool rule would have to match the
+    // CLI's rewritten name, and `lookup.price` becomes `lookup_price` there.
     assert_eq!(
         fake.value_after("--allowedTools").as_deref(),
-        Some("mcp__rig__add")
+        Some("mcp__rig")
     );
 }
 
