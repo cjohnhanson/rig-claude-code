@@ -44,9 +44,9 @@ The public surface, in full:
   names the tool. The shape is `"type": "object"` at the top level,
   `properties` an object if present, `required` an array of strings if
   present, no top-level `anyOf`, `oneOf`, or `allOf`, and property keys in
-  `[A-Za-z0-9_.-]{1,64}`. The CLI handles each of these in silence: one tool
-  outside the shape makes it load none of the tools it was given, and a
-  combinator or a bad key makes it rewrite or skip the tool by remote flag.
+  `[A-Za-z0-9_.-]{1,64}`. The CLI handles each of these in silence. One tool
+  outside the shape makes it load none of the tools it was given. A
+  combinator or a bad key makes it rewrite or skip the tool, by remote flag.
 - `UnsupportedSetting`: a public, downcastable cause for every request setting
   the transport cannot express: `temperature`, `max_tokens`,
   `additional_params`, a `tool_choice` of `Required` or `Specific`, a last

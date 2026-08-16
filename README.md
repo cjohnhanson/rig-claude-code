@@ -280,11 +280,11 @@ The consequences for a caller:
   model wrote it before any result existed. rig's runner asks again.
 - The crate honors a `tool_choice` of `Auto` or `None`. It refuses `Required`
   and `Specific`: the CLI's harness decides whether the model calls a tool.
-- A tool's `parameters` must fit the MCP tool shape: a JSON object with
-  `"type": "object"` at the top level, a `properties` that is an object if
-  present, and a `required` that is an array of strings if present. The
-  schema must also have no top-level `anyOf`, `oneOf`, or `allOf`, and each
-  property key must match `[A-Za-z0-9_.-]{1,64}`. Otherwise the turn fails
+- A tool's `parameters` must fit the MCP tool shape. That is a JSON object
+  with `"type": "object"` at the top level. If `properties` is present, it is
+  an object. If `required` is present, it is an array of strings. The schema
+  must also have no top-level `anyOf`, `oneOf`, or `allOf`, and each property
+  key must match `[A-Za-z0-9_.-]{1,64}`. Otherwise the turn fails
   with a `RequestError` whose cause is an `InvalidToolSchema` that names the
   tool. The reason is that the CLI handles each of these cases in silence.
   One tool outside the shape, such as `{}` or `"required": "x"`, makes the
