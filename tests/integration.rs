@@ -407,6 +407,7 @@ async fn the_argument_vector_is_exactly_what_the_crate_intends() {
             "--setting-sources",
             "",
             "--disable-slash-commands",
+            "--exclude-dynamic-system-prompt-sections",
         ]
     );
 }
@@ -435,6 +436,7 @@ async fn a_streaming_argument_vector_is_exactly_what_the_crate_intends() {
             "--setting-sources",
             "",
             "--disable-slash-commands",
+            "--exclude-dynamic-system-prompt-sections",
         ]
     );
 }

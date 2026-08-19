@@ -54,6 +54,14 @@ pub(crate) struct CommandSpec {
 /// Code 2.1.233, a one-word prompt costs about 42,000 input tokens with the
 /// defaults and about 165 with these flags.
 ///
+/// `--exclude-dynamic-system-prompt-sections` is the load-bearing one on
+/// Claude Code 2.1.234 and later. There, `--system-prompt` replaces the base
+/// prompt but the CLI still appends its dynamic sections: the environment
+/// block, the working directory, and every `CLAUDE.md` up the tree. On 2.1.233
+/// the other flags were enough; on 2.1.235 a run in a repo with a large
+/// `CLAUDE.md` reached about 260,000 tokens without this flag. It needs
+/// `--system-prompt` to take effect.
+///
 /// `--bare` looks like it belongs here and does not: it forces authentication
 /// through `ANTHROPIC_API_KEY` and never reads the subscription credential,
 /// which defeats the purpose of this crate.
@@ -64,6 +72,7 @@ const LEAN_FLAGS: &[&str] = &[
     "--setting-sources",
     "",
     "--disable-slash-commands",
+    "--exclude-dynamic-system-prompt-sections",
 ];
 
 /// The largest serialized output schema that fits safely in one argument.
@@ -707,6 +716,12 @@ mod tests {
         assert_eq!(value_after(&spec, "--setting-sources"), Some(""));
         assert!(spec.args.contains(&"--strict-mcp-config".to_owned()));
         assert!(spec.args.contains(&"--disable-slash-commands".to_owned()));
+        // The dynamic sections carry the CLAUDE.md and the environment on
+        // 2.1.234 and later, so a lean call must exclude them.
+        assert!(
+            spec.args
+                .contains(&"--exclude-dynamic-system-prompt-sections".to_owned())
+        );
     }
 
     #[test]
