@@ -315,7 +315,7 @@ mod tests {
 
     #[tokio::test]
     async fn yields_nothing_for_empty_input() {
-        assert!(collect_lines(b"").await.unwrap().is_empty());
+        assert_eq!(collect_lines(b"").await.unwrap(), Vec::<String>::new());
     }
 
     #[tokio::test]
