@@ -30,8 +30,9 @@ use rig_core::message::AssistantContent;
 use rmcp::ErrorData;
 use rmcp::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ContentBlock, Implementation, ListToolsResult,
-    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig,
+    Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::StreamableHttpService;
@@ -79,25 +80,27 @@ struct Handler {
 }
 
 impl ServerHandler for Handler {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::LATEST)
             .with_server_info(Implementation::new(SERVER_NAME, env!("CARGO_PKG_VERSION")))
     }
 
-    async fn list_tools(
+    fn list_tools(
         &self,
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
-    ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(self.tools.as_ref().clone()))
+    ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
+        std::future::ready(Ok(ListToolsResult::with_all_items(
+            self.tools.as_ref().clone(),
+        )))
     }
 
-    async fn call_tool(
+    fn call_tool(
         &self,
         request: CallToolRequestParams,
         _: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> impl Future<Output = Result<CallToolResponse, ErrorData>> + Send + '_ {
         let arguments = serde_json::Value::Object(request.arguments.unwrap_or_default());
         let call = RecordedCall {
             id: rig_core::id::generate(),
@@ -107,9 +110,10 @@ impl ServerHandler for Handler {
         if let Ok(mut calls) = self.calls.lock() {
             calls.push(call);
         }
-        Ok(CallToolResult::success(vec![ContentBlock::text(
+        std::future::ready(Ok(CallToolResult::success(vec![ContentBlock::text(
             PLACEHOLDER,
-        )]))
+        )])
+        .into()))
     }
 }
 

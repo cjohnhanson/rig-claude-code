@@ -1934,6 +1934,7 @@ mod tools {
             })
         }
 
+        #[allow(clippy::unused_async_trait_impl)]
         async fn call(
             &self,
             _context: &mut ToolContext,
