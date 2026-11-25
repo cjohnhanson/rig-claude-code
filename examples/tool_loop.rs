@@ -39,6 +39,8 @@ impl Tool for LookupPrice {
         })
     }
 
+    // A real tool awaits its work; this one answers from a constant.
+    #[allow(clippy::unused_async_trait_impl)]
     async fn call(
         &self,
         _: &mut ToolContext,

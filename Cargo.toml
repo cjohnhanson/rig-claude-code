@@ -28,7 +28,7 @@ hyper-util = { version = "0.1.20", features = ["service", "server", "server-auto
 # macros, so it must not pin a TLS backend for applications that wanted a
 # different one.
 rig-core = { version = "0.41", default-features = false }
-rmcp = { version = "2.2", features = ["server", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
+rmcp = { version = "3.11", features = ["server", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3.27.0"
@@ -47,7 +47,7 @@ rig = "0.41"
 # macros, so it must not pin a TLS backend for applications that wanted a
 # different one.
 rig-core = { version = "0.41", default-features = false }
-rmcp = { version = "2.2", features = ["client", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "3.11", features = ["client", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
 schemars = "1"
 serde = "1"
 serde_json = "1"
